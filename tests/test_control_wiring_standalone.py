@@ -25,6 +25,23 @@ namespace = {'time': time, 'HVACMode': SimpleNamespace(OFF='off', HEAT='heat'),
 exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
 control_method = namespace['_async_control_heating']
 
+turn_off_method = next(n for n in thermostat.body if isinstance(n, ast.AsyncFunctionDef)
+                       and n.name == '_async_heater_turn_off')
+turn_off_namespace = {
+    'time': time,
+    'HVACMode': SimpleNamespace(OFF='off'),
+    'entity_operation': lifecycle.entity_operation,
+    'output_available': lambda state: state is not None and state.state not in ('unknown', 'unavailable'),
+    'ATTR_ENTITY_ID': 'entity_id',
+    'HA_DOMAIN': 'homeassistant',
+    'SERVICE_TURN_ON': 'turn_on',
+    'SERVICE_TURN_OFF': 'turn_off',
+    '_LOGGER': logging.getLogger(__name__),
+}
+exec(compile(ast.Module(body=[turn_off_method], type_ignores=[]), str(source), 'exec'),
+     turn_off_namespace)
+turn_off = turn_off_namespace['_async_heater_turn_off']
+
 
 class RemovalBase:
     def __init__(self):
@@ -221,6 +238,51 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         await control_method(t)
         t.calc_pid.assert_awaited_once()
         t.set_control_value.assert_awaited_once()
+
+    async def test_sampled_controller_still_gates_normal_sensor_driven_pid(self):
+        t, _, _ = self.make_thermostat()
+        t._sampling_period = timedelta(seconds=300)
+        await control_method(t, calc_pid=True)
+        t.calc_pid.assert_not_awaited()
+        t.set_control_value.assert_awaited_once()
+
+    async def test_force_pid_bypasses_sampling_gate_once(self):
+        t, _, _ = self.make_thermostat()
+        t._sampling_period = timedelta(seconds=300)
+        await control_method(t, calc_pid=True, force_pid=True)
+        t.calc_pid.assert_awaited_once()
+        t.set_control_value.assert_awaited_once()
+
+    async def test_off_command_reports_failure_when_only_unrelated_output_is_reachable(self):
+        service_calls = []
+
+        async def call(domain, service, data):
+            service_calls.append((domain, service, data))
+
+        states = {
+            'switch.heat': SimpleNamespace(state='unavailable'),
+            'switch.cool': SimpleNamespace(state='off'),
+        }
+        t = SimpleNamespace(
+            _operations=lifecycle.EntityOperations(),
+            _heater_entity_id=['switch.heat'],
+            _cooler_entity_id=['switch.cool'],
+            heater_or_cooler_entity=['switch.heat'],
+            hass=SimpleNamespace(
+                states=SimpleNamespace(get=lambda entity: states[entity]),
+                services=SimpleNamespace(async_call=call),
+            ),
+            _is_device_active=True,
+            _hvac_mode='heat',
+            _last_heat_cycle_time=0,
+            _min_on_cycle_duration=timedelta(0),
+            _heater_polarity_invert=False,
+            _is_toggle_entity_domain=lambda entity: entity.startswith('switch.'),
+            entity_id='climate.thermostat',
+        )
+
+        self.assertFalse(await turn_off(t))
+        self.assertEqual(service_calls, [])
 
 
 if __name__ == '__main__':

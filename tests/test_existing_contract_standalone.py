@@ -40,8 +40,7 @@ class CompatibilityTests(unittest.TestCase):
                         'temperature_unit', 'current_temperature', 'target_temperature'))
 
     def test_existing_commands_unchanged(self):
-        self.unchanged(('async_set_temperature', 'async_set_pid_mode',
-                        'clear_integral'))
+        self.unchanged(('async_set_pid_mode', 'clear_integral'))
 
     def test_minimum_cycle_and_output_selection_unchanged(self):
         self.unchanged(('_min_on_cycle_duration', '_min_off_cycle_duration',

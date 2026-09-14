@@ -16,10 +16,12 @@ tree = ast.parse(SOURCE.read_text())
 thermostat = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SmartThermostat")
 methods = [n for n in thermostat.body if isinstance(n, ast.AsyncFunctionDef)
            and n.name in ("async_set_hvac_mode", "async_turn_on", "async_turn_off",
-                          "async_set_pid", "async_set_preset_temp")]
+                          "async_set_pid", "async_set_preset_temp", "async_set_temperature")]
 namespace = {
     "HVACMode": SimpleNamespace(OFF="off", HEAT="heat", COOL="cool", HEAT_COOL="heat_cool"),
     "ClimateEntityFeature": SimpleNamespace(PRESET_MODE=8),
+    "ATTR_TEMPERATURE": "temperature",
+    "PRESET_NONE": "none",
     "entity_operation": lifecycle.entity_operation,
     "_LOGGER": logging.getLogger(__name__),
 }
@@ -42,6 +44,8 @@ class ModeChangeTests(unittest.IsolatedAsyncioTestCase):
             _control_output=50,
             _support_flags=1,
             _preset_modes_temp={},
+            _preset_temp_modes={},
+            _preset_sync_mode="none",
             min_temp=7,
             max_temp=35,
             _pwm=True,
@@ -57,6 +61,7 @@ class ModeChangeTests(unittest.IsolatedAsyncioTestCase):
             _async_heater_turn_off=AsyncMock(),
             _async_set_valve_value=AsyncMock(),
             _async_control_heating=AsyncMock(),
+            async_set_preset_mode=AsyncMock(),
             async_write_ha_state=Mock(),
             entity_id="climate.test",
         )
@@ -129,6 +134,16 @@ class ModeChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t._kp, 10)
         t._pid_controller.set_pid_param.assert_called_once_with(10, 2, 3, 4)
         t._async_control_heating.assert_not_awaited()
+        t.async_write_ha_state.assert_called_once()
+
+    async def test_target_temperature_change_forces_immediate_pid_sample(self):
+        t = self.thermostat(mode="heat", active=True)
+        t._current_temp = 21
+        await namespace["async_set_temperature"](t, temperature=22)
+        self.assertEqual(t._target_temp, 22)
+        self.assertTrue(t._force_on)
+        t.async_set_preset_mode.assert_awaited_once_with("none")
+        t._async_control_heating.assert_awaited_once_with(calc_pid=True, force_pid=True)
         t.async_write_ha_state.assert_called_once()
 
     async def test_setting_preset_temp_enables_preset_mode_feature(self):
