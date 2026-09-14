@@ -171,3 +171,15 @@ python -m py_compile custom_components/smart_thermostat/climate.py custom_compon
 ## Attribution
 
 Originally created by [ScratMan](https://github.com/ScratMan/HASmartThermostat). This fork keeps that foundation and carries local fixes, UI configuration work, and adaptive-learning experiments for Home Assistant systems that need tighter thermostat behavior.
+
+Code provenance and inspiration references:
+
+- [ScratMan/HASmartThermostat](https://github.com/ScratMan/HASmartThermostat): original integration foundation, climate entity model, PID thermostat behavior, services, and Home Assistant custom component structure.
+- [afewyards/ha-adaptive-climate](https://github.com/afewyards/ha-adaptive-climate/tree/0d32c1fdf06a86bdabe2c5ee533b14df0fba78f1): pinned Adaptive Climate reference used for broader PID adaptation work. The copied or adapted modules are documented in `ADAPTIVE_DESIGN.md`; the retained license notice is in `ADAPTIVE_CLIMATE_LICENSE`.
+- Adaptive Climate copied/adapted code paths in this fork:
+  - `custom_components/smart_thermostat/adaptive_pid_rules.py`, adapted from `adaptive/pid_rules.py`.
+  - `custom_components/smart_thermostat/adaptive_cycle_analysis.py`, copied from the upstream cycle-analysis module.
+  - `custom_components/smart_thermostat/adaptive_robust_stats.py`, copied from `adaptive/robust_stats.py`.
+  - `custom_components/smart_thermostat/adaptive_pid_constants.py`, retained constants needed by the adapted PID rule engine.
+  - `custom_components/smart_thermostat/reference_core/`, retained reference snapshot for compatibility checks and design comparison, not loaded as the active Home Assistant platform.
+- [br3ttb/Arduino-PID-Library](https://github.com/br3ttb/Arduino-PID-Library): PID controller design reference already cited by the original controller implementation.
