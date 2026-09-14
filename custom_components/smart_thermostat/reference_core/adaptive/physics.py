@@ -1,0 +1,866 @@
+"""Physics-based PID initialization for Adaptive Climate.
+
+This module provides functions to calculate initial PID parameters based on
+thermal properties of zones and heating system characteristics.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+try:
+    from ..const import HeatingType
+except ImportError:
+    # Fallback for test environment
+    from custom_components.adaptive_climate.const import HeatingType
+
+# Re-export floor physics functions for backward compatibility
+from .floor_physics import (
+    validate_floor_construction,
+    calculate_floor_thermal_properties,
+)
+
+
+@dataclass
+class HeatingObservation:
+    """Single heating observation for rolling window calculation."""
+
+    timestamp: float
+    temp_delta: float
+    heat_seconds: float
+
+
+class RollingWindowHeatingRate:
+    """Track heating rate over rolling time window.
+
+    For slow systems (floor, radiator) where per-cycle rise time
+    isn't meaningful due to thermal lag.
+    """
+
+    def __init__(self, window_seconds: float) -> None:
+        """Initialize rolling window heating rate tracker.
+
+        Args:
+            window_seconds: Time window in seconds for observations.
+        """
+        self._window = window_seconds
+        self._observations: deque[HeatingObservation] = deque()
+
+    def add_observation(
+        self,
+        timestamp: float,
+        temp_delta: float,
+        heat_seconds: float,
+    ) -> None:
+        """Add a heating observation.
+
+        Args:
+            timestamp: Timestamp of observation (monotonic time).
+            temp_delta: Temperature change in °C.
+            heat_seconds: Amount of heat delivered in seconds.
+        """
+        self._observations.append(
+            HeatingObservation(
+                timestamp=timestamp,
+                temp_delta=temp_delta,
+                heat_seconds=heat_seconds,
+            )
+        )
+        self._prune_old(timestamp)
+
+    def _prune_old(self, now: float) -> None:
+        """Remove observations outside window.
+
+        Args:
+            now: Current timestamp (monotonic time).
+        """
+        cutoff = now - self._window
+        while self._observations and self._observations[0].timestamp < cutoff:
+            self._observations.popleft()
+
+    def get_heating_rate(self) -> float | None:
+        """Get heating rate in °C per second.
+
+        Returns:
+            Heating rate in °C per second, or None if insufficient observations.
+        """
+        if not self._observations:
+            return None
+
+        total_temp = sum(o.temp_delta for o in self._observations)
+        total_heat = sum(o.heat_seconds for o in self._observations)
+
+        if total_heat == 0:
+            return None
+
+        return total_temp / total_heat
+
+
+# Energy rating to insulation quality mapping
+# Higher insulation = less impact from outdoor temperature = lower initial Ke
+# Values restored to correct scale in v0.7.1 (100x from v0.7.0 incorrect scaling)
+ENERGY_RATING_TO_INSULATION: dict[str, float] = {
+    "A++++": 0.1,  # Outstanding insulation - extremely minimal outdoor impact
+    "A+++": 0.15,  # Excellent insulation - minimal outdoor impact
+    "A++": 0.25,  # Very good insulation
+    "A+": 0.35,  # Good insulation
+    "A": 0.45,  # Standard good insulation
+    "B": 0.55,  # Moderate insulation
+    "C": 0.7,  # Poor insulation - significant outdoor impact
+    "D": 0.85,  # Very poor insulation
+    "E": 1.0,  # Minimal insulation
+    "F": 1.15,  # Below minimum standards
+    "G": 1.3,  # No effective insulation
+}
+
+
+# Glazing U-values in W/(m²·K) - lower is better insulation
+GLAZING_U_VALUES = {
+    "single": 5.8,  # Single pane glass
+    "double": 2.8,  # Standard double glazing
+    "hr": 2.8,  # HR (same as double)
+    "hr+": 1.8,  # HR+ improved
+    "hr++": 1.1,  # HR++ high performance
+    "hr+++": 0.6,  # Triple glazing
+    "triple": 0.6,  # Alias for HR+++
+}
+
+
+def calculate_thermal_time_constant(
+    volume_m3: float | None = None,
+    energy_rating: str | None = None,
+    window_area_m2: float | None = None,
+    floor_area_m2: float | None = None,
+    window_rating: str = "hr++",
+    floor_construction: dict | None = None,
+    area_m2: float | None = None,
+    heating_type: str | None = None,
+) -> float:
+    """Calculate thermal time constant (tau) in hours.
+
+    The thermal time constant represents how quickly a zone responds to
+    heating changes. It can be estimated from zone volume or energy rating,
+    and adjusted for window heat loss. For floor heating systems, it can
+    be further adjusted based on floor construction thermal properties.
+
+    Args:
+        volume_m3: Zone volume in cubic meters. If provided, tau is estimated
+                   as volume_m3 / 50 (larger spaces respond more slowly).
+        energy_rating: Building energy efficiency rating (A+++, A++, A+, A, B, C, D).
+                       Higher ratings mean better insulation and slower cooling.
+        window_area_m2: Total window/glass area in square meters.
+        floor_area_m2: Zone floor area in square meters (needed for window ratio).
+        window_rating: Glazing type (single, double, hr, hr+, hr++, hr+++, triple).
+                       Higher ratings mean better insulation. Default: hr++.
+        floor_construction: Optional floor construction configuration dict with:
+                           - 'layers': List of layer dicts
+                           - 'pipe_spacing_mm': Pipe spacing in millimeters
+                           When provided with heating_type='floor_hydronic', adjusts tau
+                           based on floor thermal properties.
+        area_m2: Zone area in square meters. Required if floor_construction provided.
+        heating_type: Heating system type. Required if floor_construction provided.
+
+    Returns:
+        Thermal time constant in hours.
+
+    Raises:
+        ValueError: If neither volume_m3 nor energy_rating is provided.
+        ValueError: If floor_construction provided but area_m2 is missing.
+        ValueError: If floor_construction provided but heating_type is missing.
+    """
+    if volume_m3 is not None:
+        # Estimate tau based on zone volume
+        # Larger spaces have higher thermal mass and respond more slowly
+        tau_base = volume_m3 / 50.0
+    elif energy_rating is not None:
+        # Estimate tau based on energy efficiency rating
+        # Better insulation = slower temperature changes = higher tau
+        rating_map = {
+            "A++++": 10.0,  # Outstanding insulation, extremely slow response
+            "A+++": 8.0,  # Excellent insulation, very slow response
+            "A++": 6.0,  # Very good insulation
+            "A+": 5.0,  # Good insulation
+            "A": 4.0,  # Standard good insulation
+            "B": 3.0,  # Moderate insulation
+            "C": 2.5,  # Poor insulation
+            "D": 2.0,  # Very poor insulation, fast response
+        }
+        tau_base = rating_map.get(energy_rating.upper(), 4.0)
+    else:
+        raise ValueError("Either volume_m3 or energy_rating must be provided")
+
+    # Adjust tau for window heat loss if window parameters provided
+    if window_area_m2 and floor_area_m2 and floor_area_m2 > 0:
+        # Get U-value for glazing type (default to HR++ if unknown)
+        u_value = GLAZING_U_VALUES.get(window_rating.lower(), 1.1)
+
+        # Window ratio: what fraction of floor area is glass
+        window_ratio = window_area_m2 / floor_area_m2
+
+        # Heat loss factor normalized to HR++ (U=1.1) at 20% window ratio as baseline
+        # Higher U-value (worse insulation) and more glass = more heat loss = lower tau
+        heat_loss_factor = (u_value / 1.1) * (window_ratio / 0.2)
+
+        # Reduce tau by up to 40% for high glass area / poor insulation
+        # Factor of 0.15 means: at baseline (HR++, 20% windows), reduction is 15%
+        tau_reduction = min(heat_loss_factor * 0.15, 0.4)
+        tau_base *= 1 - tau_reduction
+
+    # Adjust tau for floor construction if provided (only for floor_hydronic)
+    if floor_construction is not None:
+        # Validate required parameters
+        if area_m2 is None:
+            raise ValueError("area_m2 is required when floor_construction is provided")
+        if heating_type is None:
+            raise ValueError("heating_type is required when floor_construction is provided")
+
+        # Only apply floor construction modifier for floor hydronic heating
+        if heating_type == HeatingType.FLOOR_HYDRONIC:
+            # Extract layers and pipe spacing from floor_construction dict
+            layers = floor_construction.get("layers")
+            pipe_spacing_mm = floor_construction.get("pipe_spacing_mm", 150)
+
+            # Calculate floor thermal properties
+            floor_props = calculate_floor_thermal_properties(
+                layers=layers, area_m2=area_m2, pipe_spacing_mm=pipe_spacing_mm
+            )
+
+            # Apply tau modifier
+            tau_modifier = floor_props["tau_modifier"]
+            tau_base *= tau_modifier
+
+    return tau_base
+
+
+def calculate_power_scaling_factor(
+    heating_type: str,
+    area_m2: float | None,
+    max_power_w: float | None,
+    supply_temperature: float | None = None,
+) -> float:
+    """Calculate power scaling factor for PID gains based on heater power and supply temp.
+
+    The process gain (system response to heating input) depends on heater power
+    and supply water temperature. Systems with lower power density (W/m²) or
+    lower supply temperature respond more slowly and need higher PID gains.
+
+    This function calculates a scaling factor that adjusts PID gains to account
+    for heater power and supply temperature deviating from the baseline for each
+    heating type.
+
+    Args:
+        heating_type: Type of heating system (floor_hydronic, radiator, etc.)
+        area_m2: Zone floor area in square meters. Required if max_power_w provided.
+        max_power_w: Total heater power in watts. If None, power scaling is 1.0.
+        supply_temperature: Actual supply water temperature in °C. If None, temp
+                           scaling is 1.0. Lower temps than reference → higher gains.
+
+    Returns:
+        Combined scaling factor (0.25 - 4.0). Values > 1.0 indicate undersized system
+        or low supply temp (needs higher gains), < 1.0 indicates oversized system
+        or high supply temp (needs lower gains).
+
+    Formula:
+        power_factor = baseline_power_density / actual_power_density
+        temp_factor = reference_ΔT / actual_ΔT  (where ΔT = supply_temp - 20°C)
+        combined = power_factor * temp_factor
+
+    Example:
+        - 50m² zone with floor_hydronic (baseline 20 W/m², reference 45°C)
+        - 500W heater installed (10 W/m² actual), 35°C supply temp
+        - power_factor = 20 / 10 = 2.0
+        - temp_factor = (45-20) / (35-20) = 25 / 15 = 1.67
+        - combined = 2.0 * 1.67 = 3.33 (higher gains for low-temp undersized system)
+    """
+    # Import here to avoid circular dependency
+    from ..const import HEATING_TYPE_CHARACTERISTICS
+
+    # Get characteristics for heating type
+    heating_chars = HEATING_TYPE_CHARACTERISTICS.get(heating_type, HEATING_TYPE_CHARACTERISTICS["convector"])
+
+    # Calculate power scaling factor
+    if max_power_w is None or area_m2 is None or area_m2 <= 0:
+        power_factor = 1.0
+    else:
+        baseline_power_w_m2 = heating_chars.get("baseline_power_w_m2", 60)
+        actual_power_w_m2 = max_power_w / area_m2
+        # Power scaling: inverse relationship
+        # Lower power density → higher gains needed (slower response)
+        power_factor = baseline_power_w_m2 / actual_power_w_m2
+
+    # Calculate supply temperature scaling factor
+    if supply_temperature is not None:
+        ref_supply = heating_chars.get("reference_supply_temp", 55.0)
+        # Reference ΔT = reference supply temp - room temp (20°C)
+        ref_delta_t = ref_supply - 20.0
+        # Actual ΔT = actual supply temp - room temp, clamped to 5-60°C range
+        actual_delta_t = max(5.0, min(60.0, supply_temperature - 20.0))
+        # Lower supply temp → smaller ΔT → higher gains needed
+        temp_factor = ref_delta_t / actual_delta_t
+        # Clamp temp_factor to 0.5 - 2.0 range for safety
+        temp_factor = max(0.5, min(2.0, temp_factor))
+    else:
+        temp_factor = 1.0
+
+    # Combined scaling factor
+    combined_factor = power_factor * temp_factor
+
+    # Clamp combined to 0.25x - 4.0x range for safety
+    # 0.25x = system 4x oversized / high temp (very fast, needs conservative gains)
+    # 4.0x = system 4x undersized / low temp (very slow, needs aggressive gains)
+    combined_factor = max(0.25, min(4.0, combined_factor))
+
+    return combined_factor
+
+
+def calculate_initial_pid(
+    thermal_time_constant: float,
+    heating_type: str = "floor_hydronic",
+    area_m2: float | None = None,
+    max_power_w: float | None = None,
+    supply_temperature: float | None = None,
+) -> tuple[float, float, float]:
+    """Calculate initial PID parameters using hybrid multi-point empirical model.
+
+    Implements improved physics-based initialization with better tau scaling:
+    - Kp ∝ 1/(tau × √tau) - proportional gain reduces with thermal mass
+    - Ki ∝ 1/tau - integral responds slower for high thermal mass systems
+    - Kd ∝ tau - derivative damping increases with thermal mass
+
+    This hybrid approach combines reference building profiles with continuous
+    tau-based scaling for better adaptation to diverse building characteristics.
+
+    Args:
+        thermal_time_constant: System thermal time constant in hours (tau).
+        heating_type: Type of heating system. Valid values:
+            - "floor_hydronic": Floor heating with water (very slow, high mass)
+            - "radiator": Traditional radiators (moderate response)
+            - "convector": Convection heaters (faster response)
+            - "forced_air": Forced air heating (fast response)
+        area_m2: Zone floor area in square meters. Required for power scaling.
+        max_power_w: Total heater power in watts. If provided with area_m2,
+                     PID gains are scaled based on power density.
+        supply_temperature: Supply water temperature in °C. If provided, PID gains
+                           are scaled based on deviation from reference supply temp.
+                           Lower temps than reference → higher gains needed.
+
+    Returns:
+        Tuple of (Kp, Ki, Kd) PID parameters.
+
+    Notes:
+        - Reference points calibrated from real-world systems across tau range
+        - Continuous scaling allows interpolation between reference points
+        - Power and supply temp scaling account for undersized/low-temp systems
+        - v0.7.1: Hybrid model with improved tau scaling formulas
+    """
+    # Multi-point reference building profiles (v0.7.1)
+    # Each profile represents empirical data from different building types
+    # Reference profiles calibrated at specific tau values
+    reference_profiles = {
+        HeatingType.FLOOR_HYDRONIC: [
+            # (tau_hours, kp, ki, kd) - calibrated reference points
+            # Ki raised +60% vs v0.7.1: P-on-M means integral carries entire steady-state
+            # load; floor systems need faster accumulation because night setback resets integral
+            (2.0, 0.45, 3.2, 1.4),  # Well-insulated floor heating, fast response
+            (4.0, 0.30, 1.9, 2.5),  # Standard floor heating, moderate mass
+            (6.0, 0.22, 1.3, 3.3),  # High thermal mass floor, slow response
+            (8.0, 0.18, 1.0, 3.2),  # Very slow floor heating, high mass
+        ],
+        HeatingType.RADIATOR: [
+            (1.5, 0.70, 3.0, 1.2),  # Fast radiator system
+            (3.0, 0.50, 2.0, 2.0),  # Standard radiator
+            (5.0, 0.36, 1.3, 2.8),  # Slow radiator, high mass building
+        ],
+        HeatingType.CONVECTOR: [
+            (1.0, 1.10, 6.0, 0.7),  # Fast convector, low mass
+            (2.5, 0.80, 4.0, 1.2),  # Standard convector
+            (4.0, 0.60, 2.8, 1.8),  # Slow convector, higher mass
+        ],
+        HeatingType.FORCED_AIR: [
+            (0.5, 1.80, 12.0, 0.4),  # Very fast forced air, minimal mass
+            (1.5, 1.20, 8.0, 0.8),  # Standard forced air
+            (3.0, 0.85, 5.5, 1.3),  # Slow forced air, higher mass building
+        ],
+    }
+
+    # Get reference profiles for heating type, default to radiator
+    profiles = reference_profiles.get(heating_type, reference_profiles[HeatingType.RADIATOR])
+
+    # Find bracketing reference points for interpolation
+    tau = thermal_time_constant if thermal_time_constant > 0 else 2.0
+
+    # Kp scaling: Kp ∝ 1/(tau × √tau)
+    # Rationale:
+    #   - Base: Kp ∝ 1/tau (Ziegler-Nichols for first-order systems)
+    #   - Additional √tau factor accounts for thermal mass damping
+    #   - Higher thermal mass needs proportionally lower Kp to prevent oscillation
+    #   - Formula validated against reference profiles from real-world systems
+
+    # If tau is below lowest reference point, use improved scaling from lowest point
+    if tau <= profiles[0][0]:
+        tau_ref, kp_ref, ki_ref, kd_ref = profiles[0]
+        # Scale using improved formulas: Kp ∝ 1/(tau × √tau), Ki ∝ 1/tau, Kd ∝ tau
+        tau_ratio = tau_ref / tau
+        Kp = kp_ref * tau_ratio * (tau_ratio**0.5)  # Kp ∝ 1/(tau × √tau)
+        Ki = ki_ref * tau_ratio  # Ki ∝ 1/tau
+        Kd = kd_ref / tau_ratio  # Kd ∝ tau
+    # If tau is above highest reference point, use improved scaling from highest point
+    elif tau >= profiles[-1][0]:
+        tau_ref, kp_ref, ki_ref, kd_ref = profiles[-1]
+        tau_ratio = tau_ref / tau
+        Kp = kp_ref * tau_ratio * (tau_ratio**0.5)  # Kp ∝ 1/(tau × √tau)
+        Ki = ki_ref * tau_ratio  # Ki ∝ 1/tau
+        Kd = kd_ref / tau_ratio  # Kd ∝ tau
+    # Otherwise, interpolate between bracketing reference points
+    else:
+        # Find bracketing points
+        lower_profile = profiles[0]
+        upper_profile = profiles[-1]
+        for i in range(len(profiles) - 1):
+            if profiles[i][0] <= tau <= profiles[i + 1][0]:
+                lower_profile = profiles[i]
+                upper_profile = profiles[i + 1]
+                break
+
+        # Linear interpolation between reference points
+        tau_lower, kp_lower, ki_lower, kd_lower = lower_profile
+        tau_upper, kp_upper, ki_upper, kd_upper = upper_profile
+
+        # Interpolation factor (0.0 at lower, 1.0 at upper)
+        alpha = (tau - tau_lower) / (tau_upper - tau_lower)
+
+        Kp = kp_lower + alpha * (kp_upper - kp_lower)
+        Ki = ki_lower + alpha * (ki_upper - ki_lower)
+        Kd = kd_lower + alpha * (kd_upper - kd_lower)
+
+    # Apply power and supply temperature scaling if configured
+    # Undersized systems or low supply temps need higher gains
+    scaling_factor = calculate_power_scaling_factor(heating_type, area_m2, max_power_w, supply_temperature)
+    Kp *= scaling_factor
+    Ki *= scaling_factor
+    # Note: Kd is NOT scaled - derivative term responds to rate of change,
+    # not absolute heating capacity or supply temperature
+
+    return (round(Kp, 4), round(Ki, 5), round(Kd, 2))
+
+
+def calculate_initial_pwm_period(heating_type: str = "floor_hydronic") -> int:
+    """Calculate initial PWM (Pulse Width Modulation) period in seconds.
+
+    The PWM period determines how frequently the heating actuator cycles
+    on/off. Longer periods reduce mechanical wear but slower response.
+
+    Args:
+        heating_type: Type of heating system. Valid values:
+            - "floor_hydronic": Floor heating with water
+            - "radiator": Traditional radiators
+            - "convector": Convection heaters
+            - "forced_air": Forced air heating
+
+    Returns:
+        PWM period in seconds.
+
+    Notes:
+        - Floor heating uses long periods to reduce valve cycling
+        - Forced air can use shorter periods for faster response
+    """
+    # PWM period lookup table based on heating system characteristics
+    # Longer periods = less wear, slower response
+    # Shorter periods = faster response, more wear
+    pwm_periods = {
+        HeatingType.FLOOR_HYDRONIC: 900,  # 15 minutes - minimize valve wear
+        HeatingType.RADIATOR: 600,  # 10 minutes - moderate valve cycling
+        HeatingType.CONVECTOR: 300,  # 5 minutes - faster response
+        HeatingType.FORCED_AIR: 180,  # 3 minutes - very fast response
+    }
+
+    return pwm_periods.get(heating_type, 600)  # Default to 10 minutes
+
+
+def calculate_initial_ke(
+    energy_rating: str | None = None,
+    window_area_m2: float | None = None,
+    floor_area_m2: float | None = None,
+    window_rating: str = "hr++",
+    heating_type: str = "floor_hydronic",
+    supply_temperature: float | None = None,
+) -> float:
+    """Calculate initial Ke (outdoor temperature compensation) parameter.
+
+    Ke adjusts the PID output based on outdoor temperature difference from
+    a reference point. A well-tuned Ke reduces integral wind-up during
+    outdoor temperature changes.
+
+    The initial value is estimated based on:
+    - Building energy rating (insulation quality)
+    - Window area and rating (heat loss through glazing)
+    - Heating system type (response characteristics)
+    - Supply water temperature (lower temp = less capacity = needs higher Ke)
+
+    Args:
+        energy_rating: Building energy efficiency rating (A+++, A++, A+, A, B, C, D, E, F, G).
+                       Higher ratings mean better insulation and lower Ke.
+        window_area_m2: Total window/glass area in square meters.
+        floor_area_m2: Zone floor area in square meters (needed for window ratio).
+        window_rating: Glazing type (single, double, hr, hr+, hr++, hr+++, triple).
+                       Poorer glazing increases outdoor temperature impact.
+        heating_type: Type of heating system. Slower systems (floor_hydronic)
+                      benefit more from outdoor compensation.
+        supply_temperature: Supply water temperature in °C. Lower temps than
+                           reference need higher Ke to compensate proactively.
+
+    Returns:
+        Initial Ke value (typically 0.1 - 0.8 for well-insulated buildings,
+        0.8 - 1.5 for poorly insulated buildings). Restored to correct scale in v0.7.1.
+    """
+    # Base Ke from energy rating
+    if energy_rating:
+        base_ke = ENERGY_RATING_TO_INSULATION.get(energy_rating.upper(), 0.45)
+    else:
+        # Default to moderate insulation if not specified
+        base_ke = 0.45
+
+    # Adjust for window heat loss
+    if window_area_m2 and floor_area_m2 and floor_area_m2 > 0:
+        # Get U-value for glazing type
+        u_value = GLAZING_U_VALUES.get(window_rating.lower(), 1.1)
+
+        # Window ratio: what fraction of floor area is glass
+        window_ratio = window_area_m2 / floor_area_m2
+
+        # Higher window ratio and worse glazing = more outdoor impact = higher Ke
+        # Normalized to HR++ (U=1.1) at 20% window ratio as baseline
+        window_factor = (u_value / 1.1) * (window_ratio / 0.2)
+
+        # Adjust Ke up to +50% for high glass / poor insulation
+        base_ke *= 1.0 + min(window_factor * 0.25, 0.5)
+
+    # Adjust for heating system type
+    # Slower systems benefit more from outdoor compensation
+    # These are multiplicative factors (not absolute values), applied to base_ke
+    # No scaling needed for v0.7.1 - these remain as dimensionless multipliers
+    heating_type_factors = {
+        HeatingType.FLOOR_HYDRONIC: 2.0,  # Slow response + P-on-M: E-term must carry more steady-state load
+        HeatingType.RADIATOR: 1.0,  # Baseline
+        HeatingType.CONVECTOR: 0.8,  # Faster response - less Ke needed
+        HeatingType.FORCED_AIR: 0.6,  # Fast response - minimal Ke needed
+    }
+    type_factor = heating_type_factors.get(heating_type, 1.0)
+    base_ke *= type_factor
+
+    # Adjust for supply temperature
+    # Lower supply temp = less thermal capacity per cycle = needs higher Ke
+    # Uses same reference temps as PID power scaling
+    if supply_temperature is not None:
+        from ..const import HEATING_TYPE_CHARACTERISTICS
+
+        heating_chars = HEATING_TYPE_CHARACTERISTICS.get(
+            heating_type, HEATING_TYPE_CHARACTERISTICS.get("convector", {})
+        )
+        ref_supply = heating_chars.get("reference_supply_temp", 55.0)
+        ref_delta_t = ref_supply - 20.0
+        actual_delta_t = max(5.0, min(60.0, supply_temperature - 20.0))
+        temp_factor = ref_delta_t / actual_delta_t
+        # Clamp to 0.5 - 2.0 range for safety
+        temp_factor = max(0.5, min(2.0, temp_factor))
+        base_ke *= temp_factor
+
+    # Round to 4 decimal places (was 2, now more precision needed)
+    return round(base_ke, 4)
+
+
+def estimate_cooling_time_constant(heating_tau: float, cooling_type: str = "forced_air") -> float:
+    """Estimate cooling time constant from heating time constant.
+
+    Cooling systems typically have faster response than heating due to
+    cooler surface temperatures and different convection patterns. This
+    function estimates the cooling tau by applying a tau_ratio based on
+    the cooling system type.
+
+    Args:
+        heating_tau: Thermal time constant for heating in hours.
+        cooling_type: Type of cooling system. Valid values include both
+                     dedicated cooling types and heating types (for dual systems):
+            - "forced_air": Fast cooling (AC, heat pump)
+            - "chilled_water": Chilled water system
+            - "mini_split": Ductless mini-split
+            - "radiator": Radiator-based cooling (fan coil units)
+            - "convector": Convector-based cooling
+            - "floor_hydronic": Floor cooling with chilled water
+
+    Returns:
+        Cooling time constant in hours (heating_tau * tau_ratio).
+
+    Notes:
+        - tau_ratio values come from COOLING_TYPE_CHARACTERISTICS in const.py
+        - Heating types map to closest cooling system equivalent
+        - Cooling is typically 1.5-3x faster than heating (tau_ratio 0.3-0.6)
+    """
+    # Import here to avoid circular dependency
+    from ..const import COOLING_TYPE_CHARACTERISTICS
+
+    # Map heating types to cooling characteristics
+    # For heating types used in cooling mode, map to closest equivalent
+    cooling_type_map = {
+        "forced_air": "forced_air",  # Direct match
+        "mini_split": "mini_split",  # Direct match
+        "chilled_water": "chilled_water",  # Direct match
+        "radiator": "radiator",  # Fan coil units - moderate cooling
+        "convector": "convector",  # Convector cooling - moderate
+        "floor_hydronic": "floor_hydronic",  # Floor cooling - slow response
+    }
+
+    # Get mapped cooling type (default to forced_air if unknown)
+    mapped_type = cooling_type_map.get(cooling_type, "forced_air")
+
+    # Get cooling characteristics (fallback to forced_air if not found)
+    cooling_chars = COOLING_TYPE_CHARACTERISTICS.get(mapped_type, COOLING_TYPE_CHARACTERISTICS["forced_air"])
+
+    # Calculate cooling tau using tau_ratio
+    tau_ratio = cooling_chars.get("tau_ratio", 0.3)
+    cooling_tau = heating_tau * tau_ratio
+
+    return cooling_tau
+
+
+def calculate_initial_cooling_pid(
+    thermal_time_constant: float,
+    cooling_type: str = "forced_air",
+    area_m2: float | None = None,
+    max_power_w: float | None = None,
+) -> tuple[float, float, float]:
+    """Calculate initial PID parameters for cooling mode.
+
+    Similar to calculate_initial_pid but optimized for cooling dynamics.
+    Cooling typically requires higher proportional gain (1.5-2x) for the
+    same tau due to different heat transfer characteristics.
+
+    Args:
+        thermal_time_constant: System thermal time constant in hours (tau).
+                               Can be either heating tau or cooling tau depending on context.
+        cooling_type: Type of cooling system. Valid values include both
+                     dedicated cooling types and heating types (for dual systems):
+            - "forced_air": Fast cooling (AC, heat pump)
+            - "chilled_water": Chilled water system
+            - "mini_split": Ductless mini-split
+            - "radiator": Radiator-based cooling (fan coil units)
+            - "convector": Convector-based cooling
+            - "floor_hydronic": Floor cooling with chilled water
+        area_m2: Zone floor area in square meters. Required for power scaling.
+        max_power_w: Total cooling power in watts. If provided with area_m2,
+                     PID gains are scaled based on power density.
+
+    Returns:
+        Tuple of (Kp, Ki, Kd) PID parameters for cooling mode.
+
+    Notes:
+        - Kp is amplified ~1.5-2x vs heating for same tau due to cooling dynamics
+        - pid_modifier from COOLING_TYPE_CHARACTERISTICS adjusts gains
+        - Power scaling works same as heating version
+        - Values rounded: Kp=4 decimals, Ki=5 decimals, Kd=2 decimals
+    """
+    # Import here to avoid circular dependency
+    from ..const import COOLING_TYPE_CHARACTERISTICS
+
+    # Map cooling type to heating type for getting base PID profile
+    # This allows us to use the existing reference profiles
+    cooling_to_heating_map = {
+        "forced_air": "forced_air",
+        "mini_split": "forced_air",  # Mini-split similar to forced air
+        "chilled_water": "radiator",  # Chilled water similar to radiator
+        "radiator": "radiator",
+        "convector": "convector",
+        "floor_hydronic": "floor_hydronic",
+    }
+
+    heating_type = cooling_to_heating_map.get(cooling_type, "forced_air")
+
+    # Calculate base PID using given tau and mapped heating type
+    # This gives us the baseline PID gains for this tau value
+    base_kp, base_ki, base_kd = calculate_initial_pid(
+        thermal_time_constant,
+        heating_type,
+        area_m2=area_m2,
+        max_power_w=max_power_w,
+    )
+
+    # Apply cooling-specific multipliers
+    # Cooling needs higher Kp and Ki (1.5-2x) for faster response
+    # This is because cooling has different convection patterns
+    cooling_multiplier = 1.75  # 1.75x baseline for cooling vs heating
+
+    # Get pid_modifier from cooling characteristics
+    cooling_chars = COOLING_TYPE_CHARACTERISTICS.get(cooling_type, COOLING_TYPE_CHARACTERISTICS["forced_air"])
+    pid_modifier = cooling_chars.get("pid_modifier", 1.0)
+
+    # Apply multipliers
+    # Kp and Ki both get cooling multiplier for faster response
+    Kp = base_kp * cooling_multiplier * pid_modifier
+    Ki = base_ki * cooling_multiplier * pid_modifier
+    # Kd stays as-is - derivative provides damping which is important
+    # for all cooling systems regardless of type modifier
+    Kd = base_kd
+
+    return (round(Kp, 4), round(Ki, 5), round(Kd, 2))
+
+
+# Expected heating rates by type (°C/h) - empirical data from real-world systems
+# These represent typical performance for properly sized systems
+EXPECTED_HEATING_RATES = {
+    HeatingType.FLOOR_HYDRONIC: {
+        "min": 0.15,  # Thick slab, low supply temp
+        "baseline": 0.30,  # Standard floor heating
+        "max": 0.60,  # Thin screed, high supply temp
+        "reference_tau": 4.0,  # Reference tau for baseline rate
+    },
+    HeatingType.RADIATOR: {
+        "min": 0.50,
+        "baseline": 1.00,
+        "max": 2.00,
+        "reference_tau": 3.0,
+    },
+    HeatingType.CONVECTOR: {
+        "min": 1.00,
+        "baseline": 2.00,
+        "max": 4.00,
+        "reference_tau": 2.5,
+    },
+    HeatingType.FORCED_AIR: {
+        "min": 2.00,
+        "baseline": 4.00,
+        "max": 8.00,
+        "reference_tau": 1.5,
+    },
+}
+
+
+def calculate_expected_heating_rate(
+    heating_type: str,
+    tau: float | None = None,
+    area_m2: float | None = None,
+    max_power_w: float | None = None,
+    supply_temperature: float | None = None,
+) -> dict[str, float]:
+    """Calculate expected heating rate based on physics and system configuration.
+
+    This provides a physics-based baseline for comparison against learned rates.
+    When learned rate is significantly below expected, it indicates either:
+    - Undersized heating system
+    - Low supply temperature
+    - Poor heat transfer (blocked pipes, air in system)
+    - Building has more thermal mass than expected
+
+    Args:
+        heating_type: Type of heating system (floor_hydronic, radiator, etc.)
+        tau: Thermal time constant in hours. If provided, adjusts expected rate.
+        area_m2: Zone floor area in square meters. Required for power scaling.
+        max_power_w: Total heater power in watts. If provided, adjusts expected rate.
+        supply_temperature: Supply water temperature in °C. If provided, adjusts rate.
+
+    Returns:
+        Dict with keys:
+            - baseline: Expected rate for properly sized system (°C/h)
+            - min: Minimum reasonable rate (°C/h)
+            - max: Maximum expected rate (°C/h)
+            - adjustment_factor: Combined scaling factor applied
+    """
+    # Get expected rates for heating type
+    rates = EXPECTED_HEATING_RATES.get(heating_type, EXPECTED_HEATING_RATES[HeatingType.RADIATOR])
+
+    baseline = rates["baseline"]
+    min_rate = rates["min"]
+    max_rate = rates["max"]
+    ref_tau = rates["reference_tau"]
+
+    adjustment_factor = 1.0
+
+    # Adjust for thermal time constant (tau)
+    # Higher tau = slower system = lower expected rate
+    if tau is not None and tau > 0:
+        tau_factor = ref_tau / tau
+        # Clamp tau factor to 0.5 - 2.0 range
+        tau_factor = max(0.5, min(2.0, tau_factor))
+        adjustment_factor *= tau_factor
+
+    # Adjust for power density and supply temperature
+    # Uses same logic as PID initialization
+    power_scaling = calculate_power_scaling_factor(heating_type, area_m2, max_power_w, supply_temperature)
+    # Invert the factor: power_scaling > 1 means undersized = lower expected rate
+    # power_scaling < 1 means oversized = higher expected rate
+    power_factor = 1.0 / power_scaling
+    adjustment_factor *= power_factor
+
+    # Apply adjustment to all rates
+    adjusted_baseline = baseline * adjustment_factor
+    adjusted_min = min_rate * adjustment_factor
+    adjusted_max = max_rate * adjustment_factor
+
+    return {
+        "baseline": round(adjusted_baseline, 3),
+        "min": round(adjusted_min, 3),
+        "max": round(adjusted_max, 3),
+        "adjustment_factor": round(adjustment_factor, 3),
+    }
+
+
+def calculate_ke_wind(
+    energy_rating: str | None = None,
+    window_area_m2: float | None = None,
+    floor_area_m2: float | None = None,
+    window_rating: str = "hr++",
+) -> float:
+    """Calculate wind speed compensation coefficient (Ke_wind per m/s).
+
+    Wind speed increases convective heat loss from building surfaces,
+    particularly affecting windows and poorly insulated walls. This
+    coefficient scales the outdoor temperature compensation based on
+    wind speed.
+
+    The wind compensation is applied as: Ke_wind * wind_speed * dext
+    This means wind amplifies the outdoor temperature effect.
+
+    Args:
+        energy_rating: Building energy efficiency rating. Better insulation
+                      reduces wind penetration.
+        window_area_m2: Total window/glass area in square meters.
+        floor_area_m2: Zone floor area in square meters.
+        window_rating: Glazing type. Poorer glazing more affected by wind.
+
+    Returns:
+        Ke_wind coefficient (per m/s), typically 0.01 - 0.03.
+        Default 0.02 per m/s for moderate insulation.
+    """
+    # Base wind coefficient - moderate insulation
+    base_ke_wind = 0.02
+
+    # Adjust for building insulation quality
+    if energy_rating:
+        # Better insulation = less wind impact
+        rating_factors = {
+            "A++++": 0.5,  # Excellent air sealing
+            "A+++": 0.6,
+            "A++": 0.7,
+            "A+": 0.8,
+            "A": 0.9,
+            "B": 1.0,  # Baseline
+            "C": 1.2,
+            "D": 1.4,
+            "E": 1.6,
+            "F": 1.8,
+            "G": 2.0,  # Poor air sealing, significant wind penetration
+        }
+        base_ke_wind *= rating_factors.get(energy_rating.upper(), 1.0)
+
+    # Adjust for window exposure
+    if window_area_m2 and floor_area_m2 and floor_area_m2 > 0:
+        u_value = GLAZING_U_VALUES.get(window_rating.lower(), 1.1)
+        window_ratio = window_area_m2 / floor_area_m2
+
+        # More windows and worse glazing = more wind impact
+        window_factor = (u_value / 1.1) * (window_ratio / 0.2)
+        base_ke_wind *= 1.0 + min(window_factor * 0.3, 0.5)
+
+    # Round to 3 decimal places
+    return round(base_ke_wind, 3)
+

@@ -1,0 +1,126 @@
+{
+  "title": "Smart thermostat",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add thermostat",
+        "data": {
+          "name": "Name",
+          "heater": "Heating outputs",
+          "cooler": "Cooling outputs",
+          "target_sensor": "Indoor temperature sensor",
+          "outdoor_sensor": "Outdoor temperature sensor",
+          "ac_mode": "Ac mode",
+          "invert_heater": "Invert heater",
+          "force_off_state": "Force off state",
+          "keep_alive": "Control interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "invalid_configuration": "The configuration is invalid. Check that an output is selected, temperature and output bounds are ordered, and values match their allowed types."
+    },
+    "abort": {
+      "already_configured": "This thermostat is already imported. Edit its settings in the UI.",
+      "invalid_configuration": "The configuration is invalid. Check that an output is selected, temperature and output bounds are ordered, and values match their allowed types."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Thermostat settings",
+        "menu_options": {
+          "controller": "Controller",
+          "temperatures": "Temperatures",
+          "presets": "Presets",
+          "timing": "Timing",
+          "pid": "PID and learning",
+          "output": "Output and diagnostics"
+        }
+      },
+      "controller": {
+        "title": "Controller",
+        "data": {
+          "name": "Name",
+          "heater": "Heating outputs",
+          "cooler": "Cooling outputs",
+          "target_sensor": "Indoor temperature sensor",
+          "outdoor_sensor": "Outdoor temperature sensor",
+          "ac_mode": "Ac mode",
+          "invert_heater": "Invert heater",
+          "force_off_state": "Force off state"
+        }
+      },
+      "temperatures": {
+        "title": "Temperatures",
+        "data": {
+          "min_temp": "Min temp",
+          "max_temp": "Max temp",
+          "target_temp": "Target temp",
+          "cold_tolerance": "Cold tolerance",
+          "hot_tolerance": "Hot tolerance",
+          "precision": "Precision",
+          "target_temp_step": "Target temp step",
+          "initial_hvac_mode": "Initial hvac mode"
+        }
+      },
+      "presets": {
+        "title": "Presets",
+        "data": {
+          "preset_sync_mode": "Preset sync mode",
+          "away_temp": "Away temp",
+          "eco_temp": "Eco temp",
+          "boost_temp": "Boost temp",
+          "comfort_temp": "Comfort temp",
+          "home_temp": "Home temp",
+          "sleep_temp": "Sleep temp",
+          "activity_temp": "Activity temp"
+        }
+      },
+      "timing": {
+        "title": "Timing",
+        "data": {
+          "keep_alive": "Control interval (seconds)",
+          "min_cycle_duration": "Min cycle duration",
+          "min_off_cycle_duration": "Min off cycle duration",
+          "min_cycle_duration_pid_off": "Min cycle duration pid off",
+          "min_off_cycle_duration_pid_off": "Min off cycle duration pid off",
+          "sampling_period": "Sampling period",
+          "sensor_stall": "Sensor stall",
+          "pwm": "PWM period (seconds)"
+        }
+      },
+      "pid": {
+        "title": "PID and learning",
+        "data": {
+          "kp": "Configured proportional gain (Kp)",
+          "ki": "Configured integral gain (Ki, per second)",
+          "kd": "Configured derivative gain (Kd, seconds)",
+          "ke": "Outdoor compensation gain (Ke)",
+          "adaptive_observe": "Observe thermal response",
+          "adaptive_learning": "Automatic PID learning",
+          "autotune": "Legacy autotune rule",
+          "noiseband": "Noiseband",
+          "lookback": "Lookback",
+          "boost_pid_off": "Boost pid off"
+        },
+        "description": "These are configured gains. Runtime learned gains are reported separately on the thermostat. Automatic learning is still under development; enabling it does not guarantee calibration."
+      },
+      "output": {
+        "title": "Output and diagnostics",
+        "data": {
+          "output_precision": "Output precision",
+          "output_min": "Output min",
+          "output_max": "Output max",
+          "out_clamp_low": "Out clamp low",
+          "out_clamp_high": "Out clamp high",
+          "output_safety": "Output safety",
+          "debug": "Debug"
+        }
+      }
+    },
+    "error": {
+      "invalid_configuration": "The configuration is invalid. Check that an output is selected, temperature and output bounds are ordered, and values match their allowed types."
+    }
+  }
+}

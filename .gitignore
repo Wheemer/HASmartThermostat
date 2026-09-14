@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+installed-snapshot/
+tests/local_history_sample.json
+tests/local_history_mcp_*.json
+tests/local_gain_search_*.json

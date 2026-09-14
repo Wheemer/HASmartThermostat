@@ -162,9 +162,9 @@ class PID:
         Returns:
             A value between `out_min` and `out_max`.
         """
-        if self._sampling_period != 0 and self._last_input_time is not None and \
-                time() - self._input_time < self._sampling_period:
-            return self._output, False  # If last sample is too young, keep last output value
+        # if self._sampling_period != 0 and self._last_input_time is not None and \
+        #         time() - self._input_time < self._sampling_period:
+        #     return self._output, False  # If last sample is too young, keep last output value
 
         self._last_input = self._input
         if self._sampling_period == 0:
@@ -178,7 +178,10 @@ class PID:
         if self._sampling_period == 0:
             self._input_time = input_time
         else:
-            self._input_time = time()
+            self._input_time = (
+                self._sampling_period if self._last_input_time is None
+                else self._last_input_time + self._sampling_period
+            )
         self._last_set_point = self._set_point
         self._set_point = set_point
 
@@ -229,8 +232,9 @@ class PID:
             self._derivative = 0.0
 
         # Compute PID Output
-        output = self._proportional + self._integral + self._derivative + self._external
-        self._output = max(min(output, self._out_max), self._out_min)
+        # Don't add external compensation to output as it will be added in main climate logic.
+        self._output = self._proportional + self._integral + self._derivative #  + self._external
+        # self._output = max(min(self._output, self._out_max), self._out_min)
         return self._output, True
 
 
@@ -523,4 +527,4 @@ class PIDAutotune:
                 period2 = self._peak_timestamps[4] - self._peak_timestamps[2]
                 self._Pu = 0.5 * (period1 + period2)
                 return True
-            return False
+        return False
