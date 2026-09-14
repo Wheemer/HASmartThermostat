@@ -12,7 +12,8 @@ class PID:
     error: float
 
     def __init__(self, kp, ki, kd, ke=0, out_min=float('-inf'), out_max=float('+inf'),
-                 sampling_period=0, cold_tolerance=0.3, hot_tolerance=0.3):
+                 sampling_period=0, cold_tolerance=0.3, hot_tolerance=0.3,
+                 derivative_filter_alpha=1.0):
         """A proportional-integral-derivative controller.
             :param kp: Proportional coefficient.
             :type kp: float
@@ -32,6 +33,9 @@ class PID:
             :type cold_tolerance: float
             :param hot_tolerance: time period between two PID calculations in seconds
             :type hot_tolerance: float
+            :param derivative_filter_alpha: 1.0 keeps raw derivative behavior; lower values
+                apply exponential smoothing to reduce temperature-sensor spikes.
+            :type derivative_filter_alpha: float
         """
         if kp is None:
             raise ValueError('kp must be specified')
@@ -41,6 +45,9 @@ class PID:
             raise ValueError('kd must be specified')
         if out_min >= out_max:
             raise ValueError('out_min must be less than out_max')
+        if not isinstance(derivative_filter_alpha, (int, float)) or isinstance(
+                derivative_filter_alpha, bool) or not 0 <= derivative_filter_alpha <= 1:
+            raise ValueError('derivative_filter_alpha must be between 0 and 1')
 
         self._Kp = kp
         self._Ki = ki
@@ -51,6 +58,7 @@ class PID:
         self._proportional = 0.0
         self._integral = 0.0
         self._derivative = 0.0
+        self._derivative_filtered = 0.0
         self._last_set_point = 0
         self._set_point = 0
         self._input = None
@@ -70,6 +78,7 @@ class PID:
         self._sampling_period = sampling_period
         self._cold_tolerance = cold_tolerance
         self._hot_tolerance = hot_tolerance
+        self._derivative_filter_alpha = float(derivative_filter_alpha)
 
     @property
     def mode(self):
@@ -147,6 +156,7 @@ class PID:
         self._input_time = None
         self._last_input = None
         self._last_input_time = None
+        self._derivative_filtered = 0.0
         
     def calc(self, input_val, set_point, input_time=None, last_input_time=None, ext_temp=None):
         """Adjusts and holds the given setpoint.
@@ -227,9 +237,15 @@ class PID:
 
         self._proportional = self._Kp * self._error
         if self._dt != 0:
-            self._derivative = -(self._Kd * self._input_diff) / self._dt
+            raw_derivative = -(self._Kd * self._input_diff) / self._dt
+            self._derivative_filtered = (
+                self._derivative_filter_alpha * raw_derivative
+                + (1 - self._derivative_filter_alpha) * self._derivative_filtered
+            )
+            self._derivative = self._derivative_filtered
         else:
             self._derivative = 0.0
+            self._derivative_filtered = 0.0
 
         # Compute PID Output
         # Don't add external compensation to output as it will be added in main climate logic.

@@ -14,8 +14,8 @@ SECTIONS = {
     "timing": ("keep_alive", "min_cycle_duration", "min_off_cycle_duration",
                "min_cycle_duration_pid_off", "min_off_cycle_duration_pid_off",
                "sampling_period", "sensor_stall", "pwm"),
-    "pid": ("kp", "ki", "kd", "ke", "adaptive_observe", "adaptive_learning",
-            "autotune", "noiseband", "lookback", "boost_pid_off"),
+    "pid": ("kp", "ki", "kd", "ke", "derivative_filter_alpha", "adaptive_observe",
+            "adaptive_learning", "autotune", "noiseband", "lookback", "boost_pid_off"),
     "output": ("output_precision", "output_min", "output_max", "out_clamp_low",
                "out_clamp_high", "output_safety", "debug"),
 }

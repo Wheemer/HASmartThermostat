@@ -97,6 +97,7 @@
           "ki": "Configured integral gain (Ki, per second)",
           "kd": "Configured derivative gain (Kd, seconds)",
           "ke": "Outdoor compensation gain (Ke)",
+          "derivative_filter_alpha": "Derivative filter alpha",
           "adaptive_observe": "Observe thermal response",
           "adaptive_learning": "Automatic PID learning",
           "autotune": "Legacy autotune rule",

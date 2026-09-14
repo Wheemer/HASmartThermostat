@@ -140,6 +140,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(const.CONF_KI, default=const.DEFAULT_KI): vol.Coerce(float),
         vol.Optional(const.CONF_KD, default=const.DEFAULT_KD): vol.Coerce(float),
         vol.Optional(const.CONF_KE, default=const.DEFAULT_KE): vol.Coerce(float),
+        vol.Optional(const.CONF_DERIVATIVE_FILTER_ALPHA, default=const.DEFAULT_DERIVATIVE_FILTER_ALPHA):
+            vol.All(vol.Coerce(float), vol.Range(min=0, max=1)),
         vol.Optional(const.CONF_PWM, default=const.DEFAULT_PWM): vol.All(
             cv.time_period, cv.positive_timedelta
         ),
@@ -219,6 +221,7 @@ async def _async_setup_thermostat(hass, config, async_add_entities, configuratio
         'ki': config.get(const.CONF_KI),
         'kd': config.get(const.CONF_KD),
         'ke': config.get(const.CONF_KE),
+        'derivative_filter_alpha': config.get(const.CONF_DERIVATIVE_FILTER_ALPHA),
         'pwm': config.get(const.CONF_PWM),
         'boost_pid_off': config.get(const.CONF_BOOST_PID_OFF),
         'autotune': config.get(const.CONF_AUTOTUNE),
@@ -383,6 +386,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._ki = kwargs.get('ki')
         self._kd = kwargs.get('kd')
         self._ke = kwargs.get('ke')
+        self._derivative_filter_alpha = kwargs.get('derivative_filter_alpha')
         self._pwm = kwargs.get('pwm').seconds
         self._p = self._i = self._d = self._e = self._dt = 0
         self._control_output = self._pid_output = self._output_min
@@ -437,7 +441,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             self._pid_controller = pid_controller.PID(self._kp, self._ki, self._kd, self._ke,
                                                       self._min_out, self._max_out,
                                                       self._sampling_period.seconds, self._cold_tolerance,
-                                                      self._hot_tolerance)
+                                                      self._hot_tolerance,
+                                                      self._derivative_filter_alpha)
             self._pid_controller.mode = "AUTO"
 
     async def async_added_to_hass(self):
@@ -1472,7 +1477,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                                                           self._ke, self._min_out,
                                                           self._max_out, self._sampling_period.seconds,
                                                           self._cold_tolerance,
-                                                          self._hot_tolerance)
+                                                          self._hot_tolerance,
+                                                          self._derivative_filter_alpha)
                 self._autotune = "none"
             self._pid_output = self._pid_autotune.output
             self._p = self._i = self._d = error = self._dt = 0

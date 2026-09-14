@@ -72,7 +72,7 @@ The options are grouped into sections:
 - **Temperatures:** min/max limits, target temperature, hot/cold tolerances, display precision, target step, and initial HVAC mode.
 - **Presets:** away, eco, boost, comfort, home, sleep, and activity preset temperatures.
 - **Timing:** keep-alive interval, min on/off cycle durations, sampling period, sensor-stall timeout, and PWM period.
-- **PID and learning:** configured PID gains, outdoor compensation gain, adaptive observation, adaptive learning, legacy autotune, noiseband, lookback, and boost PID behavior.
+- **PID and learning:** configured PID gains, derivative filtering, outdoor compensation gain, adaptive observation, adaptive learning, legacy autotune, noiseband, lookback, and boost PID behavior.
 - **Output and diagnostics:** output precision, output min/max, output clamps, output safety value, and debug logging.
 
 ## YAML Import
@@ -122,6 +122,7 @@ This fork includes fixes for several upstream edge cases:
 - min-cycle timing still applies to same-second output reversals;
 - rejected or unavailable output commands do not reset PWM timing;
 - output min/max are honored by the effective clamps;
+- optional derivative filtering can smooth one-off temperature sensor spikes without changing default PID behavior;
 - `turn_on` and `turn_off` climate services restore the correct active HVAC mode;
 - preset service changes correctly expose or remove preset support;
 - legacy autotune continues advancing on periodic control ticks.

@@ -45,6 +45,26 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(pid.dt, 30)
         self.assertAlmostEqual(pid.integral, 0.3)
 
+    def test_derivative_filter_default_preserves_raw_derivative(self):
+        pid = PID(0, 0, 10, out_min=-100, out_max=100, sampling_period=0)
+        pid.calc(20, 21, input_time=0)
+        pid.calc(21, 21, input_time=10, last_input_time=0)
+        self.assertAlmostEqual(pid.derivative, -1.0)
+
+    def test_derivative_filter_smooths_temperature_spikes(self):
+        pid = PID(0, 0, 10, out_min=-100, out_max=100, sampling_period=0,
+                  derivative_filter_alpha=0.25)
+        pid.calc(20, 21, input_time=0)
+        pid.calc(21, 21, input_time=10, last_input_time=0)
+        self.assertAlmostEqual(pid.derivative, -0.25)
+        pid.calc(21, 21, input_time=20, last_input_time=10)
+        self.assertAlmostEqual(pid.derivative, -0.1875)
+
+    def test_derivative_filter_alpha_must_be_between_zero_and_one(self):
+        for value in (-0.1, 1.1, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                PID(0, 0, 10, derivative_filter_alpha=value)
+
     def test_autotune_analysis_scans_full_buffer_for_peaks(self):
         tuner = PIDAutotune(out_step=10, lookback=60, out_min=0, out_max=100, noiseband=0.2)
         tuner._sampletime = 10

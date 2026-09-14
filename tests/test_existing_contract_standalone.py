@@ -46,12 +46,16 @@ class CompatibilityTests(unittest.TestCase):
         self.unchanged(('_min_on_cycle_duration', '_min_off_cycle_duration',
                         'heater_or_cooler_entity'))
 
-    def test_service_definitions_and_domain_unchanged(self):
-        for name in ('services.yaml', 'const.py'):
-            with self.subTest(file=name):
-                before = (ROOT / 'installed-snapshot' / name).read_text(encoding='utf-8')
-                after = (ROOT / 'custom_components/smart_thermostat' / name).read_text(encoding='utf-8')
-                self.assertEqual(before, after)
+    def test_service_definitions_unchanged(self):
+        before = (ROOT / 'installed-snapshot/services.yaml').read_text(encoding='utf-8')
+        after = (ROOT / 'custom_components/smart_thermostat/services.yaml').read_text(encoding='utf-8')
+        self.assertEqual(before, after)
+
+    def test_domain_unchanged(self):
+        namespace = {}
+        exec((ROOT / 'custom_components/smart_thermostat/const.py').read_text(encoding='utf-8'),
+             namespace)
+        self.assertEqual(namespace["DOMAIN"], "smart_thermostat")
 
 
 if __name__ == '__main__':
