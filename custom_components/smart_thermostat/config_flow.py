@@ -40,7 +40,8 @@ def form_schema(fields, values):
     for key in fields:
         marker_type = vol.Required if key in ("name", "target_sensor", "keep_alive") else vol.Optional
         marker = marker_type(key, description={"suggested_value": values[key]}) if key in values else marker_type(key)
-        if key in ("heater", "cooler", "target_sensor", "outdoor_sensor"):
+        if key in ("heater", "cooler", "target_sensor", "outdoor_sensor",
+                   "furnace_temperature_sensor"):
             field = selector.EntitySelector(selector.EntitySelectorConfig(
                 multiple=key in ("heater", "cooler")))
         elif key in BOOLEAN_FIELDS:

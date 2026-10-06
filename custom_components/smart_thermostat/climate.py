@@ -28,6 +28,7 @@ from homeassistant.const import (
     STATE_ON,
     STATE_OFF,
     STATE_UNKNOWN,
+    STATE_UNAVAILABLE,
 )
 from homeassistant.components.number.const import (
     ATTR_VALUE,
@@ -113,6 +114,10 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(const.CONF_INVERT_HEATER, default=False): cv.boolean,
         vol.Required(const.CONF_SENSOR): cv.entity_id,
         vol.Optional(const.CONF_OUTDOOR_SENSOR): cv.entity_id,
+        vol.Optional(const.CONF_FURNACE_TEMPERATURE_SENSOR): cv.entity_id,
+        vol.Optional(const.CONF_FURNACE_TEMPERATURE_HOLD_THRESHOLD, default=40.0):
+            vol.Coerce(float),
+        vol.Optional(const.CONF_FURNACE_TEMPERATURE_CUTOFF, default=50.0): vol.Coerce(float),
         vol.Optional(const.CONF_AC_MODE): cv.boolean,
         vol.Optional(const.CONF_FORCE_OFF_STATE, default=True): cv.boolean,
         vol.Optional(const.CONF_MAX_TEMP): vol.Coerce(float),
@@ -211,6 +216,9 @@ async def _async_setup_thermostat(hass, config, async_add_entities, configuratio
         'invert_heater': config.get(const.CONF_INVERT_HEATER),
         'sensor_entity_id': config.get(const.CONF_SENSOR),
         'ext_sensor_entity_id': config.get(const.CONF_OUTDOOR_SENSOR),
+        'furnace_temperature_sensor_entity_id': config.get(const.CONF_FURNACE_TEMPERATURE_SENSOR),
+        'furnace_temperature_hold_threshold': config.get(const.CONF_FURNACE_TEMPERATURE_HOLD_THRESHOLD),
+        'furnace_temperature_cutoff': config.get(const.CONF_FURNACE_TEMPERATURE_CUTOFF),
         'min_temp': config.get(const.CONF_MIN_TEMP),
         'max_temp': config.get(const.CONF_MAX_TEMP),
         'target_temp': config.get(const.CONF_TARGET_TEMP),
@@ -318,6 +326,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._heater_polarity_invert = kwargs.get('invert_heater')
         self._sensor_entity_id = kwargs.get('sensor_entity_id')
         self._ext_sensor_entity_id = kwargs.get('ext_sensor_entity_id')
+        self._furnace_temperature_sensor_entity_id = kwargs.get(
+            'furnace_temperature_sensor_entity_id')
+        self._furnace_temperature_hold_threshold = kwargs.get(
+            'furnace_temperature_hold_threshold')
+        self._furnace_temperature_cutoff = kwargs.get('furnace_temperature_cutoff')
+        self._furnace_temperature = None
         if self._unique_id == 'none':
             self._unique_id = slugify(f"{DOMAIN}_{self._name}_{self._heater_entity_id}")
         self._ac_mode = kwargs.get('ac_mode', False)
@@ -531,6 +545,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self.async_on_remove(_async_listen_once_until_remove(
                     self.hass, EVENT_HOMEASSISTANT_STARTED, start_import))
 
+        furnace_temperature_sensor = getattr(
+            self, '_furnace_temperature_sensor_entity_id', None)
+
         @callback
         def _async_startup(*_):
             """Init on startup."""
@@ -543,6 +560,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 ext_sensor_state = self.hass.states.get(self._ext_sensor_entity_id)
                 if ext_sensor_state and ext_sensor_state.state != STATE_UNKNOWN:
                     self._async_update_ext_temp(ext_sensor_state)
+            if furnace_temperature_sensor is not None:
+                self._async_update_furnace_temperature(
+                    self.hass.states.get(furnace_temperature_sensor))
 
         if self.hass.state == CoreState.running:
             _async_startup()
@@ -562,6 +582,11 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     self.hass,
                     self._ext_sensor_entity_id,
                     self._async_ext_sensor_changed))
+        if furnace_temperature_sensor is not None:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, furnace_temperature_sensor,
+                    self._async_furnace_temperature_changed))
         if self._heater_entity_id is not None:
             self.async_on_remove(
                 async_track_state_change_event(
@@ -924,6 +949,15 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             "pid_mode": self.pid_mode,
             "pid_i": 0 if self._autotune != "none" else self.pid_control_i,
         }
+        if self._furnace_temperature_sensor_entity_id is not None:
+            device_state_attributes.update({
+                "furnace_temperature_sensor": self._furnace_temperature_sensor_entity_id,
+                "furnace_temperature": self._furnace_temperature,
+                "furnace_residual_heat_threshold": self._furnace_temperature_hold_threshold,
+                "furnace_heat_ceiling": self._furnace_temperature_cutoff,
+                "furnace_residual_heat_guard": self._furnace_residual_heat_active(),
+                "furnace_heat_ceiling_reached": self._furnace_heat_ceiling_reached(),
+            })
         if self._configured_settings is not None:
             device_state_attributes["configured_settings"] = self._configured_settings
         if self._observer is not None:
@@ -1139,6 +1173,19 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._trigger_source = 'ext_sensor'
         _LOGGER.debug("%s: Received new external temperature: %s", self.entity_id, self._ext_temp)
         await self._async_control_heating(calc_pid=False)
+
+    @callback
+    @entity_operation
+    async def _async_furnace_temperature_changed(self, event: Event[EventStateChangedData]):
+        """Use live furnace heat to stop an excessive burn and delay a repeat call."""
+        old_guard_active = self._furnace_residual_heat_active()
+        self._async_update_furnace_temperature(event.data["new_state"])
+        if self._furnace_heat_ceiling_reached():
+            await self._async_heater_turn_off()
+        elif old_guard_active and not self._furnace_residual_heat_active():
+            self._trigger_source = 'furnace_temperature'
+            await self._async_control_heating(calc_pid=True)
+        self.async_write_ha_state()
 
     @callback
     def _async_switch_changed(self, event: Event[EventStateChangedData]):
@@ -1451,6 +1498,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         targets = self.heater_or_cooler_entity
         if not targets or any(not output_available(self.hass.states.get(entity)) for entity in targets):
             return False
+        if self._furnace_residual_heat_active():
+            _LOGGER.info(
+                "%s: Holding new heat call; furnace temperature %s is above residual-heat threshold %s",
+                self.entity_id, self._furnace_temperature,
+                self._furnace_temperature_hold_threshold)
+            return False
         if self._is_device_active:
             _LOGGER.debug("%s: %s already ON; skipping duplicate command.",
                           self.entity_id, ", ".join([entity for entity in targets]))
@@ -1477,6 +1530,38 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 on_value = self._output_min if self._heater_polarity_invert else self._output_max
                 await self._async_set_entity_value(heater_or_cooler_entity, on_value)
         return True
+
+    def _async_update_furnace_temperature(self, state):
+        """Record the live furnace temperature; unknown data never causes an output command."""
+        if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            self._furnace_temperature = None
+            return
+        try:
+            self._furnace_temperature = float(state.state)
+        except (TypeError, ValueError):
+            self._furnace_temperature = None
+
+    def _furnace_residual_heat_active(self):
+        """Whether retained furnace heat must block only a new heat call."""
+        return (
+            self._furnace_temperature_sensor_entity_id is not None
+            and self._furnace_temperature is not None
+            and self._furnace_temperature_hold_threshold is not None
+            and self._furnace_temperature >= self._furnace_temperature_hold_threshold
+            and self._hvac_mode == HVACMode.HEAT
+            and not self._is_device_active
+        )
+
+    def _furnace_heat_ceiling_reached(self):
+        """Whether an active burner call has heated the furnace enough to stop."""
+        return (
+            self._furnace_temperature_sensor_entity_id is not None
+            and self._furnace_temperature is not None
+            and self._furnace_temperature_cutoff is not None
+            and self._furnace_temperature >= self._furnace_temperature_cutoff
+            and self._hvac_mode == HVACMode.HEAT
+            and self._is_device_active
+        )
 
     @entity_operation
     async def _async_heater_turn_off(self, force=False):

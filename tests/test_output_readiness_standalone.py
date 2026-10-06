@@ -28,6 +28,8 @@ def harness(states):
     names = {
         "_is_toggle_entity_domain", "_async_heater_turn_on", "_async_heater_turn_off",
         "_async_set_entity_value", "_async_set_valve_value", "_async_switch_changed",
+        "_async_update_furnace_temperature", "_furnace_residual_heat_active",
+        "_furnace_heat_ceiling_reached",
     }
     methods = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
     new_cls = ast.ClassDef(name="Harness", bases=[], keywords=[], body=methods, decorator_list=[], type_params=[])
@@ -38,7 +40,9 @@ def harness(states):
                      HA_DOMAIN="homeassistant", ATTR_VALUE="value", SERVICE_SET_VALUE="set_value",
                      VALVE_DOMAIN="valve", LIGHT_DOMAIN="light", SERVICE_TURN_LIGHT_ON="turn_on",
                      SERVICE_SET_VALVE_POSITION="set_valve_position", ATTR_POSITION="position",
-                     ATTR_BRIGHTNESS_PCT="brightness_pct")
+                     ATTR_BRIGHTNESS_PCT="brightness_pct",
+                     HVACMode=SimpleNamespace(HEAT="heat"), STATE_UNKNOWN="unknown",
+                     STATE_UNAVAILABLE="unavailable")
     exec(compile(ast.fix_missing_locations(ast.Module(body=[new_cls], type_ignores=[])), str(source), "exec"), namespace)
     obj = namespace["Harness"]()
     obj._operations = lifecycle.EntityOperations()
@@ -52,6 +56,11 @@ def harness(states):
     obj._last_heat_cycle_time = time.time() - 100
     obj._min_off_cycle_duration = obj._min_on_cycle_duration = timedelta(seconds=60)
     obj._heater_polarity_invert = False
+    obj._furnace_temperature_sensor_entity_id = None
+    obj._furnace_temperature_hold_threshold = 40.0
+    obj._furnace_temperature_cutoff = 50.0
+    obj._furnace_temperature = None
+    obj._hvac_mode = "heat"
     obj._output_min = 0
     obj._output_max = 100
     obj.entity_id = "climate.thermostat"
@@ -85,6 +94,21 @@ class ReadinessTests(IsolatedAsyncioTestCase):
         obj._is_device_active = True
         await obj._async_heater_turn_off(force=True)
         obj.hass.services.async_call.assert_awaited_once_with("homeassistant", "turn_on", {"entity_id": "switch.heat"})
+
+    async def test_hot_furnace_blocks_a_new_heat_call(self):
+        obj = harness({"switch.heat": state("off")})
+        obj._furnace_temperature_sensor_entity_id = "sensor.furnace"
+        obj._furnace_temperature = 45.0
+        await obj._async_heater_turn_on()
+        obj.hass.services.async_call.assert_not_awaited()
+
+    def test_furnace_heat_ceiling_requires_an_active_heat_call(self):
+        obj = harness({"switch.heat": state("off")})
+        obj._furnace_temperature_sensor_entity_id = "sensor.furnace"
+        obj._furnace_temperature = 50.0
+        self.assertFalse(obj._furnace_heat_ceiling_reached())
+        obj._is_device_active = True
+        self.assertTrue(obj._furnace_heat_ceiling_reached())
 
     async def test_duplicate_on_and_off_commands_are_not_replayed(self):
         obj = harness({"switch.heat": state("on")})
