@@ -15,12 +15,25 @@ class Base:
         pass
 
 
+class RuntimeStore:
+    saved = None
+
+    def __init__(self, *_args):
+        pass
+
+    async def async_load(self):
+        return self.saved
+
+    def async_delay_save(self, callback, _delay):
+        self.saved = callback()
+
+
 class StripImports(ast.NodeTransformer):
     def visit_ImportFrom(self, node):
         return None
 
 
-def harness(methods=("async_added_to_hass",)):
+def harness(methods=("async_added_to_hass", "_runtime_snapshot_is_valid", "_restore_state_is_valid", "_runtime_restore_state")):
     source = COMPONENT / "climate.py"
     tree = ast.parse(source.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SmartThermostat")
@@ -34,6 +47,7 @@ def harness(methods=("async_added_to_hass",)):
         "HVACMode": SimpleNamespace(OFF="off"), "STATE_UNKNOWN": "unknown",
         "ATTR_TEMPERATURE": "temperature", "ATTR_PRESET_MODE": "preset_mode",
         "restore_attributes": ui.restore_attributes, "_LOGGER": logging.getLogger(__name__),
+        "Store": RuntimeStore, "STATE_UNAVAILABLE": "unavailable",
         "State": lambda entity_id, state, attributes: SimpleNamespace(
             entity_id=entity_id, state=state, attributes=attributes),
         "async_track_state_change_event": Mock(return_value=Mock()),
@@ -53,6 +67,9 @@ def harness(methods=("async_added_to_hass",)):
     obj._ac_mode = False
     obj.min_temp, obj.max_temp = 7, 35
     obj.entity_id = "climate.thermostat"
+    obj.unique_id = "house_thermostat"
+    obj._attr_hvac_modes = ["heat", "off"]
+    obj._runtime_store = obj._runtime_saved = None
     obj.async_on_remove = Mock()
     obj._async_sensor_changed = AsyncMock()
     obj._async_control_heating = AsyncMock()
@@ -110,3 +127,24 @@ class RestoreTests(IsolatedAsyncioTestCase):
         await obj.async_added_to_hass()
         self.assertEqual(obj._hvac_mode, "off")
         obj.async_set_hvac_mode.assert_not_awaited()
+
+    async def test_unavailable_restore_uses_last_valid_runtime_snapshot(self):
+        obj = harness()
+        obj._configured_settings = {"activity_temp": 22.5}
+        RuntimeStore.saved = {"hvac_mode": "heat", "temperature": 22.5, "preset_mode": "activity"}
+        obj.async_get_last_state = AsyncMock(return_value=SimpleNamespace(
+            entity_id=obj.entity_id, state="unavailable", attributes={}))
+        await obj.async_added_to_hass()
+        obj.async_set_hvac_mode.assert_awaited_once_with("heat")
+        self.assertEqual(obj._target_temp, 22.5)
+        self.assertEqual(obj._attr_preset_mode, "activity")
+
+    async def test_invalid_restore_without_snapshot_does_not_apply_unavailable_mode(self):
+        obj = harness()
+        obj._configured_settings = {"kp": 100}
+        RuntimeStore.saved = None
+        obj.async_get_last_state = AsyncMock(return_value=SimpleNamespace(
+            entity_id=obj.entity_id, state="unavailable", attributes={}))
+        await obj.async_added_to_hass()
+        obj.async_set_hvac_mode.assert_not_awaited()
+        self.assertEqual(obj._hvac_mode, "off")

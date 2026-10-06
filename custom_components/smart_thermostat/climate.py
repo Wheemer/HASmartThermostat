@@ -320,6 +320,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._name = kwargs.get('name')
         self._configured_settings = None
         self._operations = EntityOperations()
+        self._runtime_store = None
+        self._runtime_saved = None
         self._unique_id = kwargs.get('unique_id')
         self._heater_entity_id = kwargs.get('heater_entity_id')
         self._cooler_entity_id = kwargs.get('cooler_entity_id', None)
@@ -494,8 +496,16 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         """Run when entity about to be added."""
         await super().async_added_to_hass()
 
+        identity = self.unique_id if self.unique_id != 'none' else self.entity_id
+        self._runtime_store = Store(self.hass, 1, f"smart_thermostat_runtime_{identity}")
+        try:
+            saved_runtime = await self._runtime_store.async_load()
+            if self._runtime_snapshot_is_valid(saved_runtime):
+                self._runtime_saved = saved_runtime
+        except Exception:
+            _LOGGER.exception("%s: Could not restore last valid thermostat state", self.entity_id)
+
         if self._observer is not None:
-            identity = self.unique_id if self.unique_id != 'none' else self.entity_id
             self._observer_store = Store(self.hass, 1, f"smart_thermostat_learning_{identity}")
             try:
                 saved_learning = await self._observer_store.async_load()
@@ -614,7 +624,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
 
         @callback
         def _async_shutdown(_event: Event) -> None:
-            """Stop heat before Home Assistant tears down service handling."""
+            """Persist intent, then stop heat before service teardown."""
+            self._save_runtime_snapshot()
             self.hass.async_create_task(
                 self._async_turn_off_heaters_for_shutdown(),
                 f"{self.entity_id} shutdown heater off")
@@ -622,8 +633,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self.async_on_remove(_async_listen_once_until_remove(
             self.hass, EVENT_HOMEASSISTANT_STOP, _async_shutdown))
 
-        # Check If we have an old state
+        # Restore only a complete thermostat state. Home Assistant can retain a
+        # transient unavailable record after a failed reload; it must never erase
+        # the previous requested mode, target, or preset.
         old_state = await self.async_get_last_state()
+        if not self._restore_state_is_valid(old_state):
+            old_state = self._runtime_restore_state()
         if old_state is not None and self._configured_settings is not None:
             from homeassistant.core import State
 
@@ -786,6 +801,58 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     def _is_toggle_entity_domain(entity_id):
         domain = entity_id.split('.')[0]
         return domain not in (VALVE_DOMAIN, LIGHT_DOMAIN)
+
+    def _runtime_snapshot(self):
+        """Return the last valid requested thermostat state for restart recovery."""
+        mode = self._hvac_mode
+        target = self._target_temp
+        if mode not in self._attr_hvac_modes or not isinstance(target, (int, float)) or not isfinite(target):
+            return None
+        return {
+            "hvac_mode": str(mode),
+            "temperature": float(target),
+            "preset_mode": self._attr_preset_mode,
+        }
+
+    @staticmethod
+    def _runtime_snapshot_is_valid(snapshot):
+        """Return whether a persisted snapshot can safely restore user intent."""
+        if not isinstance(snapshot, dict):
+            return False
+        mode = snapshot.get("hvac_mode")
+        target = snapshot.get("temperature")
+        return (mode not in (None, STATE_UNKNOWN, STATE_UNAVAILABLE)
+                and isinstance(target, (int, float)) and isfinite(target))
+
+    def _restore_state_is_valid(self, state):
+        """Reject incomplete restore records created while the entity was unavailable."""
+        if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            return False
+        target = state.attributes.get(ATTR_TEMPERATURE)
+        return (state.state in self._attr_hvac_modes
+                and isinstance(target, (int, float)) and isfinite(target))
+
+    def _runtime_restore_state(self):
+        """Build a restore-compatible state from the last valid runtime snapshot."""
+        if not self._runtime_snapshot_is_valid(self._runtime_saved):
+            return None
+        from homeassistant.core import State
+        return State(self.entity_id, self._runtime_saved["hvac_mode"], {
+            ATTR_TEMPERATURE: self._runtime_saved["temperature"],
+            ATTR_PRESET_MODE: self._runtime_saved.get("preset_mode"),
+        })
+
+    def _save_runtime_snapshot(self):
+        """Persist only complete thermostat intent, never an unavailable transition."""
+        snapshot = self._runtime_snapshot()
+        if snapshot is not None and self._runtime_store is not None:
+            self._runtime_saved = snapshot
+            self._runtime_store.async_delay_save(lambda: snapshot, 1)
+
+    def async_write_ha_state(self):
+        """Publish state and retain a valid recovery point for restart/reload."""
+        super().async_write_ha_state()
+        self._save_runtime_snapshot()
 
     @property
     def precision(self):
