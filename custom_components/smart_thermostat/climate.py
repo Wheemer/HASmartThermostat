@@ -432,6 +432,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._pwm = kwargs.get('pwm').seconds
         self._p = self._i = self._d = self._e = self._dt = 0
         self._control_output = self._pid_output = self._output_min
+        self._pwm_schedule_initialized = False
         self._force_on = False
         self._force_off = False
         self._boost_pid_off = kwargs.get('boost_pid_off')
@@ -1832,6 +1833,16 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             # a mathematically preserved duty cycle with an hours-long on phase.
             time_on = self._pwm
             time_off = 0
+        # A restart has no legitimate PWM phase to resume: Home Assistant has
+        # already stopped the physical output for shutdown safety. Start the
+        # first real demand after the normal minimum-off guard instead of
+        # inventing an initial off window from the new process timestamp.
+        if not getattr(self, '_pwm_schedule_initialized', False) and not self._is_device_active:
+            if await self._async_heater_turn_on():
+                self._pwm_schedule_initialized = True
+                self._time_changed = time.time()
+                self._force_on = False
+            return
         if self._is_device_active:
             if time_on <= time_passed or self._force_off:
                 _LOGGER.info(
