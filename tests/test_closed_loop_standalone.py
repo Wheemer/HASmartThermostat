@@ -53,6 +53,32 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device._time_changed, -900)
         self.assertTrue(device._force_on)
 
+    async def test_startup_settle_holds_full_demand_off_briefly(self):
+        device, clock = controller(calculate()['gains'], 20, 22)
+        device._time_changed = 0
+        device._startup_control_ready_at = 60
+        device._control_output = 100
+
+        await device.set_control_value()
+        self.assertFalse(device._is_device_active)
+
+        clock.now = 61
+        await device.set_control_value()
+        self.assertTrue(device._is_device_active)
+
+    async def test_startup_partial_pwm_does_not_fire_from_stale_phase(self):
+        device, clock = controller(calculate()['gains'], 20, 22)
+        device._time_changed = 0
+        device._startup_control_ready_at = 60
+        device._control_output = 2
+
+        await device.set_control_value()
+        self.assertFalse(device._is_device_active)
+
+        clock.now = 61
+        await device.set_control_value()
+        self.assertFalse(device._is_device_active)
+
     async def test_cooler_duty_increases_as_room_gets_hotter(self):
         gains = {'kp': 10.0, 'ki': 0.0, 'kd': 0.0}
         far, far_clock = controller(gains, 27, 22, mode='cool')
@@ -82,6 +108,18 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         await device.set_control_value()
         self.assertTrue(device._is_device_active)
         self.assertNotIn((1201, False), device.transitions)
+
+    async def test_near_saturated_pwm_does_not_create_unbounded_on_phase(self):
+        device, clock = controller(calculate()['gains'], 20, 22)
+        device._control_output = 99
+        await device.set_control_value()
+        self.assertTrue(device._is_device_active)
+
+        clock.now = device._pwm + 1
+        await device.set_control_value()
+
+        self.assertFalse(device._is_device_active)
+        self.assertIn((clock.now, False), device.transitions)
 
     async def test_closed_loop_has_real_transitions_and_obeys_minimums(self):
         result = await simulate(calculate()['gains'], seconds=7200)

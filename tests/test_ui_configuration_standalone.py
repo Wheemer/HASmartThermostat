@@ -59,13 +59,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result["kp"], 120)
         self.assertEqual(result["sleep_temp"], 20.2)
 
-    def test_explicit_edit_overrides_old_gain_and_clears_integral(self):
-        old = {"configured_settings": {"kp": 100}, "kp": 120, "Kp": 120, "pid_i": 30}
-        result = ui.restore_attributes(old, {"kp": 90})
-        self.assertEqual(result["kp"], 90)
-        self.assertNotIn("Kp", result)
-        self.assertNotIn("pid_i", result)
-        self.assertEqual(old["kp"], 120)
+    def test_explicit_target_edit_overrides_old_target_attribute(self):
+        old = {"configured_settings": {"target_temp": 21.5}, "temperature": 21.5}
+        result = ui.restore_attributes(old, {"target_temp": 22.5})
+        self.assertEqual(result["temperature"], 22.5)
+        self.assertEqual(old["temperature"], 21.5)
 
     def test_explicit_preset_removal_does_not_restore_it(self):
         old = {"configured_settings": {"sleep_temp": 19.5}, "sleep_temp": 20.2}

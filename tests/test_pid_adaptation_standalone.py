@@ -45,12 +45,14 @@ class PIDTests(unittest.TestCase):
     def test_pwm_oscillations_are_not_mistaken_for_bad_tuning(self):
         self.assertIsNone(self.propose(overshoot=0, oscillations=10))
 
-    def test_zero_gains_seed_missing_derivative_from_overshoot(self):
+    def test_zero_derivative_reduces_proportional_for_overshoot(self):
         self.gains['ki'] = self.gains['kd'] = 0
         result = self.propose()
         self.assertEqual(result['new']['ki'], 0)
-        self.assertGreater(result['new']['kd'], 0)
-        self.assertEqual(result['seeded_gains'], ['kd'])
+        self.assertEqual(result['new']['kd'], 0)
+        self.assertEqual(result['new']['kp'], 95.0)
+        self.assertEqual(result['seeded_gains'], [])
+        self.assertIn('Kd disabled; reducing Kp for overshoot', result['reasons'])
         self.assertEqual(self.engine.reason, 'proposal_ready')
 
     def test_zero_integral_seeds_from_undershoot(self):

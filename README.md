@@ -30,6 +30,7 @@ Smart Thermostat creates a Home Assistant climate entity that drives one or more
 - Supports PWM output, proportional output, outdoor compensation, min-cycle guards, output safety, sensor-stall protection, and optional legacy autotune.
 - Adds optional adaptive observation and PID learning diagnostics from recent Home Assistant history.
 - Restores runtime PID gains, presets, target temperature, and learning state after reload or restart.
+- Turns configured heating outputs off during a Home Assistant shutdown before service handling is torn down.
 - Can be unloaded and reloaded as a Home Assistant config entry.
 
 ## Install

@@ -19,6 +19,7 @@ from homeassistant.const import (
     CONF_NAME,
     CONF_UNIQUE_ID,
     EVENT_HOMEASSISTANT_START,
+    EVENT_HOMEASSISTANT_STOP,
     PRECISION_HALVES,
     PRECISION_TENTHS,
     PRECISION_WHOLE,
@@ -66,6 +67,7 @@ from . import DOMAIN, PLATFORMS
 from . import const
 from . import pid_controller
 from .adaptive import ThermalObserver, has_session_timing
+from .coast_control import CoastControl
 from .history_learning import import_recent_history
 from .pid_adaptation import PIDAdaptation
 from .pid_units import hourly_to_seconds_id
@@ -76,6 +78,30 @@ from .output_readiness import output_available
 from homeassistant.helpers.storage import Store
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _async_listen_once_until_remove(hass, event_type, listener):
+    """Register a one-shot listener with cleanup that no-ops after it fires."""
+    fired = False
+    removed = False
+
+    @callback
+    def wrapped_listener(*args):
+        nonlocal fired
+        fired = True
+        listener(*args)
+
+    remove_listener = hass.bus.async_listen_once(event_type, wrapped_listener)
+
+    @callback
+    def remove():
+        nonlocal removed
+        if removed or fired:
+            return
+        removed = True
+        remove_listener()
+
+    return remove
 
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
@@ -401,9 +427,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._adaptive_ready = False
         self._adaptive_saved = None
         self._adaptive_journal = None
+        self._adaptive_stored_gains = None
         self._adaptive_error = None
         self._observer = ThermalObserver(rise_tolerance=abs(kwargs.get('cold_tolerance'))) if (
             self._adaptive_learning_requested or kwargs.get('adaptive_observe', False)) else None
+        self._coast_control = CoastControl() if (
+            self._adaptive_learning_requested and self._observer is not None) else None
         self._observer_store = None
         self._history_import_task = None
         self._output_reconcile_task = None
@@ -423,7 +452,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._noiseband = kwargs.get('noiseband')
         self._cold_tolerance = abs(kwargs.get('cold_tolerance'))
         self._hot_tolerance = abs(kwargs.get('hot_tolerance'))
-        self._time_changed = 0
+        now = time.time()
+        self._time_changed = now
+        self._startup_control_ready_at = now + 60
         self._last_sensor_update = time.time()
         self._last_ext_sensor_update = time.time()
         if self._autotune != "none":
@@ -456,8 +487,11 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 saved_learning = await self._observer_store.async_load()
                 self._observer.restore(saved_learning)
                 if isinstance(saved_learning, dict):
+                    if self._coast_control is not None:
+                        self._coast_control.restore(saved_learning.get('coast_control'), time.time())
                     self._adaptive_saved = saved_learning.get('pid_adaptation')
                     self._adaptive_journal = saved_learning.get('gain_transaction')
+                    self._adaptive_stored_gains = saved_learning.get('current_gains')
             except Exception:
                 self._adaptive_error = 'learning_restore_failed'
                 _LOGGER.exception("%s: Could not restore thermal observations", self.entity_id)
@@ -494,8 +528,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 start_import()
             else:
                 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-                self.async_on_remove(self.hass.bus.async_listen_once(
-                    EVENT_HOMEASSISTANT_STARTED, start_import))
+                self.async_on_remove(_async_listen_once_until_remove(
+                    self.hass, EVENT_HOMEASSISTANT_STARTED, start_import))
 
         @callback
         def _async_startup(*_):
@@ -513,7 +547,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         if self.hass.state == CoreState.running:
             _async_startup()
         else:
-            self.async_on_remove(self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, _async_startup))
+            self.async_on_remove(_async_listen_once_until_remove(
+                self.hass, EVENT_HOMEASSISTANT_START, _async_startup))
 
         # Add listener
         self.async_on_remove(
@@ -552,6 +587,16 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     self.calc_pid,
                     self._sampling_period))
 
+        @callback
+        def _async_shutdown(_event: Event) -> None:
+            """Stop heat before Home Assistant tears down service handling."""
+            self.hass.async_create_task(
+                self._async_turn_off_heaters_for_shutdown(),
+                f"{self.entity_id} shutdown heater off")
+
+        self.async_on_remove(_async_listen_once_until_remove(
+            self.hass, EVENT_HOMEASSISTANT_STOP, _async_shutdown))
+
         # Check If we have an old state
         old_state = await self.async_get_last_state()
         if old_state is not None and self._configured_settings is not None:
@@ -583,30 +628,32 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self._pid_controller.integral = self._i
             if not self._hvac_mode and old_state.state:
                 await self.async_set_hvac_mode(old_state.state)
-            if old_state.attributes.get('kp') is not None and self._pid_controller is not None:
-                self._kp = float(old_state.attributes.get('kp'))
-                self._pid_controller.set_pid_param(kp=self._kp)
-            elif old_state.attributes.get('Kp') is not None and self._pid_controller is not None:
-                self._kp = float(old_state.attributes.get('Kp'))
-                self._pid_controller.set_pid_param(kp=self._kp)
-            if old_state.attributes.get('ki') is not None and self._pid_controller is not None:
-                self._ki = float(old_state.attributes.get('ki'))
-                self._pid_controller.set_pid_param(ki=self._ki)
-            elif old_state.attributes.get('Ki') is not None and self._pid_controller is not None:
-                self._ki = float(old_state.attributes.get('Ki'))
-                self._pid_controller.set_pid_param(ki=self._ki)
-            if old_state.attributes.get('kd') is not None and self._pid_controller is not None:
-                self._kd = float(old_state.attributes.get('kd'))
-                self._pid_controller.set_pid_param(kd=self._kd)
-            elif old_state.attributes.get('Kd') is not None and self._pid_controller is not None:
-                self._kd = float(old_state.attributes.get('Kd'))
-                self._pid_controller.set_pid_param(kd=self._kd)
-            if old_state.attributes.get('ke') is not None and self._pid_controller is not None:
-                self._ke = float(old_state.attributes.get('ke'))
-                self._pid_controller.set_pid_param(ke=self._ke)
-            elif old_state.attributes.get('Ke') is not None and self._pid_controller is not None:
-                self._ke = float(old_state.attributes.get('Ke'))
-                self._pid_controller.set_pid_param(ke=self._ke)
+            restore_runtime_gains = self._configured_settings is None
+            if restore_runtime_gains:
+                if old_state.attributes.get('kp') is not None and self._pid_controller is not None:
+                    self._kp = float(old_state.attributes.get('kp'))
+                    self._pid_controller.set_pid_param(kp=self._kp)
+                elif old_state.attributes.get('Kp') is not None and self._pid_controller is not None:
+                    self._kp = float(old_state.attributes.get('Kp'))
+                    self._pid_controller.set_pid_param(kp=self._kp)
+                if old_state.attributes.get('ki') is not None and self._pid_controller is not None:
+                    self._ki = float(old_state.attributes.get('ki'))
+                    self._pid_controller.set_pid_param(ki=self._ki)
+                elif old_state.attributes.get('Ki') is not None and self._pid_controller is not None:
+                    self._ki = float(old_state.attributes.get('Ki'))
+                    self._pid_controller.set_pid_param(ki=self._ki)
+                if old_state.attributes.get('kd') is not None and self._pid_controller is not None:
+                    self._kd = float(old_state.attributes.get('kd'))
+                    self._pid_controller.set_pid_param(kd=self._kd)
+                elif old_state.attributes.get('Kd') is not None and self._pid_controller is not None:
+                    self._kd = float(old_state.attributes.get('Kd'))
+                    self._pid_controller.set_pid_param(kd=self._kd)
+                if old_state.attributes.get('ke') is not None and self._pid_controller is not None:
+                    self._ke = float(old_state.attributes.get('ke'))
+                    self._pid_controller.set_pid_param(ke=self._ke)
+                elif old_state.attributes.get('Ke') is not None and self._pid_controller is not None:
+                    self._ke = float(old_state.attributes.get('Ke'))
+                    self._pid_controller.set_pid_param(ke=self._ke)
             if old_state.attributes.get('pid_mode') is not None and \
                     self._pid_controller is not None:
                 self._pid_controller.mode = old_state.attributes.get('pid_mode')
@@ -629,6 +676,15 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 saved = self._adaptive_saved
                 if self._adaptive_journal is not None:
                     saved = recover_gain_change(self._adaptive_journal, self._adaptive_gains())
+                elif self._adaptive_stored_gains is not None:
+                    gains = self._validated_stored_gains(self._adaptive_stored_gains)
+                    if gains is not None:
+                        self._pid_controller.set_pid_param(**gains)
+                        self._kp, self._ki, self._kd = gains['kp'], gains['ki'], gains['kd']
+                    else:
+                        _LOGGER.warning(
+                            "%s: Ignoring invalid stored adaptive gains: %s",
+                            self.entity_id, self._adaptive_stored_gains)
                 if saved is not None and not self._pid_adaptation.restore(saved, self._adaptive_gains(), time.time()):
                     raise ValueError('Saved PID learning does not match the restored controller')
                 self._adaptive_journal = None
@@ -659,6 +715,28 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             _LOGGER.exception("%s: Could not persist learning during unload", self.entity_id)
         finally:
             await super().async_will_remove_from_hass()
+
+    @entity_operation
+    async def _async_turn_off_heaters_for_shutdown(self) -> None:
+        """Prevent a configured heater from remaining on across an HA restart."""
+        if self._operations.closed:
+            return
+
+        await self._operations.close()
+        for heater_entity_id in self._heater_entity_id or []:
+            if not output_available(self.hass.states.get(heater_entity_id)):
+                continue
+            _LOGGER.warning(
+                "%s: Home Assistant is stopping; turning off %s",
+                self.entity_id,
+                heater_entity_id,
+            )
+            await self.hass.services.async_call(
+                HA_DOMAIN,
+                SERVICE_TURN_OFF,
+                {ATTR_ENTITY_ID: heater_entity_id},
+                blocking=True,
+            )
 
     @property
     def should_poll(self):
@@ -851,6 +929,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         if self._observer is not None:
             device_state_attributes['learning_pwm_seconds'] = self._pwm
             device_state_attributes['adaptive_learning'] = self._observer.diagnostics()
+            if getattr(self, '_coast_control', None) is not None:
+                device_state_attributes['adaptive_learning']['coast_control'] = (
+                    self._coast_control.diagnostics())
             if self._adaptive_learning_requested:
                 device_state_attributes['adaptive_learning'].update(
                     mode='pid_adaptation',
@@ -1086,13 +1167,32 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @callback
     def _learning_snapshot(self):
         data = self._observer.snapshot()
+        coast_control = getattr(self, '_coast_control', None)
+        if coast_control is not None:
+            data['coast_control'] = coast_control.snapshot()
         if self._pid_adaptation is not None:
+            data['current_gains'] = self._adaptive_gains()
             data['pid_adaptation'] = self._pid_adaptation.snapshot()
             data['gain_transaction'] = self._adaptive_journal
         return data
 
     def _adaptive_gains(self):
         return {'kp': self._kp, 'ki': self._ki, 'kd': self._kd}
+
+    def _validated_stored_gains(self, value):
+        if not isinstance(value, dict):
+            return None
+        gains = {}
+        for key in ('kp', 'ki', 'kd'):
+            try:
+                gain = float(value[key])
+            except (KeyError, TypeError, ValueError):
+                return None
+            lower, upper = self._pid_adaptation.limits[key]
+            if not isfinite(gain) or not lower <= gain <= upper:
+                return None
+            gains[key] = gain
+        return gains
 
     def _adaptive_context(self):
         sensor = self.hass.states.get(self._sensor_entity_id)
@@ -1264,11 +1364,38 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self._e = self._ke * (self._target_temp - self._ext_temp)
 
             # Round value to configured precision to avoid excessive updates for small changes
-            self._control_output = round(self._pid_output + self._e, self._output_precision)
+            self._control_output = round(self._pid_output, self._output_precision)
             if not self._output_precision:
                 self._control_output = int(self._control_output)
             self._control_output = max(min(self._control_output, self._max_out), self._min_out)
 
+            coast_control = getattr(self, '_coast_control', None)
+            if coast_control is not None:
+                now = time.time()
+                coast_enabled = (
+                    self._observer is not None
+                    and self._hvac_mode == HVACMode.HEAT
+                    and not self._ac_mode
+                    and bool(self._pwm)
+                    and not self._heater_polarity_invert
+                    and self._autotune == 'none'
+                    and self.pid_mode == 'auto'
+                    and self._current_temp is not None
+                    and self._target_temp is not None
+                    and self._control_output > 0
+                )
+                if coast_control.evaluate(
+                        now, self._current_temp, self._target_temp,
+                        self._is_device_active, self._observer.records,
+                        self._min_on_cycle_duration.seconds, coast_enabled):
+                    _LOGGER.info(
+                        "%s: Learned coast control suppressing heat: %s",
+                        self.entity_id,
+                        coast_control.reason,
+                    )
+                    self._control_output = 0
+                    if self._observer_store is not None:
+                        self._observer_store.async_delay_save(self._learning_snapshot, 1)
 
             await self.set_control_value()
             self.async_write_ha_state()
@@ -1510,6 +1637,15 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     async def set_control_value(self):
         """Set Output value for heater"""
         if self._pwm:
+            if (abs(self._control_output) > 0 and not self._is_device_active
+                    and time.time() < getattr(self, '_startup_control_ready_at', 0)):
+                _LOGGER.info(
+                    "%s: Startup settle period active. Holding %s OFF despite output %s",
+                    self.entity_id,
+                    ", ".join([entity for entity in self.heater_or_cooler_entity]),
+                    self._control_output,
+                )
+                return
             if abs(self._control_output) == self._difference:
                 if not self._is_device_active:
                     _LOGGER.info("%s: Output is %s. Request turning ON %s", self.entity_id,
@@ -1540,9 +1676,10 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             time_off *= self._min_on_cycle_duration.seconds / time_on
             time_on = self._min_on_cycle_duration.seconds
         if 0 < time_off < self._min_off_cycle_duration.seconds:
-            # time_off is too short, increase time_on and time_off
-            time_on *= self._min_off_cycle_duration.seconds / time_off
-            time_off = self._min_off_cycle_duration.seconds
+            # A near-saturated output should behave as continuous demand, not as
+            # a mathematically preserved duty cycle with an hours-long on phase.
+            time_on = self._pwm
+            time_off = 0
         if self._is_device_active:
             if time_on <= time_passed or self._force_off:
                 _LOGGER.info(

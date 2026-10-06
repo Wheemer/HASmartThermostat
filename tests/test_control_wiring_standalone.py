@@ -42,6 +42,20 @@ exec(compile(ast.Module(body=[turn_off_method], type_ignores=[]), str(source), '
      turn_off_namespace)
 turn_off = turn_off_namespace['_async_heater_turn_off']
 
+shutdown_method = next(n for n in thermostat.body if isinstance(n, ast.AsyncFunctionDef)
+                       and n.name == '_async_turn_off_heaters_for_shutdown')
+shutdown_namespace = {
+    'entity_operation': lifecycle.entity_operation,
+    'output_available': turn_off_namespace['output_available'],
+    'ATTR_ENTITY_ID': 'entity_id',
+    'HA_DOMAIN': 'homeassistant',
+    'SERVICE_TURN_OFF': 'turn_off',
+    '_LOGGER': logging.getLogger(__name__),
+}
+exec(compile(ast.Module(body=[shutdown_method], type_ignores=[]), str(source), 'exec'),
+     shutdown_namespace)
+turn_off_for_shutdown = shutdown_namespace['_async_turn_off_heaters_for_shutdown']
+
 
 class RemovalBase:
     def __init__(self):
@@ -120,6 +134,28 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         pending.assert_not_awaited()
         self.assertTrue(instance.base_removed)
 
+    async def test_shutdown_turns_off_only_configured_heating_outputs(self):
+        services = SimpleNamespace(async_call=AsyncMock())
+        instance = SimpleNamespace(
+            _operations=lifecycle.EntityOperations(),
+            _heater_entity_id=['input_boolean.furnace_boolean'],
+            hass=SimpleNamespace(
+                states=SimpleNamespace(get=lambda _: SimpleNamespace(state='on')),
+                services=services,
+            ),
+            entity_id='climate.thermostat',
+        )
+
+        await turn_off_for_shutdown(instance)
+
+        self.assertTrue(instance._operations.closed)
+        services.async_call.assert_awaited_once_with(
+            'homeassistant',
+            'turn_off',
+            {'entity_id': 'input_boolean.furnace_boolean'},
+            blocking=True,
+        )
+
     def make_thermostat(self):
         now = time.time()
         sensor = SimpleNamespace(state='21.8', last_updated=datetime.now(timezone.utc))
@@ -147,14 +183,16 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         t._coast_control.observe_output(now - 151, True)
         return t, sensor, output
 
-    async def test_rejected_predictive_cutoff_is_no_longer_wired(self):
+    async def test_predictive_cutoff_turns_heat_off_after_minimum_on(self):
         t, _, _ = self.make_thermostat()
         await control_method(t)
         t._async_heater_turn_off.assert_not_awaited()
         t.set_control_value.assert_awaited_once()
-        self.assertEqual(t._control_output, 20)
+        self.assertEqual(t._control_output, 0)
         self.assertEqual(t._target_temp, 22)
-        t._observer_store.async_delay_save.assert_not_called()
+        t._observer_store.async_delay_save.assert_called_once()
+        self.assertTrue(t._coast_control.suppressed)
+        self.assertEqual(t._coast_control.reason, 'predicted_target_reached_after_off')
 
     async def test_explicit_off_takes_precedence(self):
         t, _, _ = self.make_thermostat()
@@ -209,6 +247,7 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_predictive_hold_changes_normal_output(self):
         t, _, output = self.make_thermostat()
+        t._current_temp = 21.0
         await control_method(t)
         output.state = 'off'
         t._is_device_active = False
@@ -217,8 +256,23 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         t._async_heater_turn_off.assert_not_awaited()
         self.assertEqual(t.set_control_value.await_count, 3)
 
+    async def test_predictive_hold_keeps_heat_off_while_residual_heat_settles(self):
+        t, _, output = self.make_thermostat()
+        await control_method(t)
+        self.assertEqual(t._control_output, 0)
+
+        output.state = 'off'
+        t._is_device_active = False
+        t.set_control_value.reset_mock()
+        await control_method(t)
+
+        self.assertEqual(t._control_output, 0)
+        t.set_control_value.assert_awaited_once()
+        self.assertEqual(t._coast_control.reason, 'allowing_residual_heat_to_settle')
+
     async def test_control_output_respects_effective_output_max(self):
         t, _, _ = self.make_thermostat()
+        t._coast_control = None
         t._pid_output = 33.6
         t._max_out = 10
         await control_method(t)

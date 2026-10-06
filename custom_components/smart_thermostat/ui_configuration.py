@@ -24,7 +24,7 @@ PRESETS = tuple(key for key in SECTIONS["presets"] if key.endswith("_temp"))
 DURATIONS = frozenset(SECTIONS["timing"]) | {"lookback"}
 BOOLEAN_FIELDS = {"ac_mode", "invert_heater", "force_off_state", "adaptive_observe",
                   "adaptive_learning", "boost_pid_off", "debug"}
-RESTORABLE = (*PRESETS, "kp", "ki", "kd", "ke", "target_temp")
+RESTORABLE = (*PRESETS, "target_temp")
 
 
 def serialize_configuration(config):
@@ -59,19 +59,13 @@ def restore_attributes(attributes, configuration):
     previous = attributes.get("configured_settings")
     if not isinstance(previous, dict):
         return result  # First YAML import retains existing runtime state.
-    gains_changed = False
     for key in RESTORABLE:
         if configuration.get(key) == previous.get(key):
             continue
         state_key = "temperature" if key == "target_temp" else key
         result.pop(state_key, None)
-        if key in ("kp", "ki", "kd", "ke"):
-            result.pop(key.capitalize(), None)
-            gains_changed = True
         if configuration.get(key) is not None:
             result[state_key] = configuration[key]
         elif key in PRESETS and attributes.get("preset_mode") == key.removesuffix("_temp"):
             result["preset_mode"] = "none"
-    if gains_changed:
-        result.pop("pid_i", None)
     return result

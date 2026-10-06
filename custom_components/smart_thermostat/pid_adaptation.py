@@ -1,9 +1,9 @@
 """Gain proposal/validation lifecycle around the upstream Adaptive Climate rules.
 
 No actuator access. Callers must supply measured cycle metrics and gain bounds
-in their PID controller's units. The only automatic zero-gain initialization
-here is bounded, cycle-derived seeding for missing I/D terms, followed by the
-same commit and rollback validation as ordinary gain changes.
+in their PID controller's units. Automatic zero-gain initialization is limited
+to integral correction; derivative gain must be configured before it can be
+adapted.
 """
 
 from copy import deepcopy
@@ -137,10 +137,18 @@ class PIDAdaptation:
         if not results:
             self.reason = 'no_rule_triggered'
             return None
+        derivative_suppressed = (
+            gains.get('kd') == 0
+            and any(r.kd_factor > 1.0 for r in results)
+        )
         candidate = {}
         seeded = []
         for key in KEYS:
             factor = prod(getattr(r, key + '_factor') for r in results)
+            if key == 'kp' and derivative_suppressed and factor >= 1.0:
+                # Kd intentionally disabled: learn overshoot by trimming demand
+                # instead of creating derivative control behind the user's back.
+                factor = 0.95
             # Per-proposal trust region; distinct from upstream's lifetime caps.
             factor = min(1.2, max(0.8, factor))
             lower, upper = self.limits[key]
@@ -148,6 +156,9 @@ class PIDAdaptation:
                 self.reason = 'baseline_outside_controller_bounds'
                 return None
             if gains[key] == 0:
+                if key == 'kd':
+                    candidate[key] = 0
+                    continue
                 if factor <= 1.0:
                     candidate[key] = 0
                     continue
@@ -164,7 +175,8 @@ class PIDAdaptation:
             return None
         self.reason = 'proposal_ready'
         return {'old': dict(gains), 'new': candidate, 'baseline': averages,
-                'reasons': [r.reason for r in results],
+                'reasons': [r.reason for r in results] + (
+                    ['Kd disabled; reducing Kp for overshoot'] if derivative_suppressed else []),
                 'seeded_gains': seeded, 'proposed_at': now}
 
     def committed(self, proposal, now):

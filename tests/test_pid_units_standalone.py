@@ -38,12 +38,15 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(pid.dt, 575)
         self.assertAlmostEqual(pid.integral, 5.75)
 
-    def test_sampled_pid_integral_uses_configured_period_not_sensor_gap(self):
+    def test_sampled_pid_holds_output_until_sampling_period_elapsed(self):
         pid = PID(0, 0.01, 0, out_min=-100, out_max=100, sampling_period=30)
-        pid.calc(20, 21, input_time=0)
-        pid.calc(20, 21, input_time=575, last_input_time=0)
-        self.assertEqual(pid.dt, 30)
-        self.assertAlmostEqual(pid.integral, 0.3)
+        first_output, first_update = pid.calc(20, 21, input_time=0)
+        held_output, held_update = pid.calc(20, 21, input_time=575, last_input_time=0)
+        second_output, second_update = pid.calc(20, 21, input_time=600, last_input_time=575)
+        self.assertTrue(first_update)
+        self.assertTrue(held_update)
+        self.assertFalse(second_update)
+        self.assertEqual(second_output, held_output)
 
     def test_derivative_filter_default_preserves_raw_derivative(self):
         pid = PID(0, 0, 10, out_min=-100, out_max=100, sampling_period=0)

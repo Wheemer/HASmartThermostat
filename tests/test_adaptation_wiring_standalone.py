@@ -101,17 +101,17 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(t._pid_adaptation.pending)
         self.assertEqual((t._target_temp, t._hvac_mode), (22, 'heat'))
 
-    async def test_missing_derivative_is_seeded_and_validated(self):
+    async def test_zero_derivative_reduces_proportional_for_overshoot(self):
         t, _, _ = self.make()
         t._ki = t._kd = 0
         for record in t._observer.records:
             record['gains'] = t._adaptive_gains()
         self.assertTrue(await t._async_adapt_pid())
-        t._pid_controller.set_pid_param.assert_called_once()
-        gains = t._pid_controller.set_pid_param.call_args.kwargs
-        self.assertEqual(gains['ki'], 0)
-        self.assertGreater(gains['kd'], 0)
-        self.assertEqual(t._pid_adaptation.pending['seeded_gains'], ['kd'])
+        t._pid_controller.set_pid_param.assert_called_once_with(kp=95.0, ki=0, kd=0)
+        self.assertEqual(t._kp, 95.0)
+        self.assertEqual(t._ki, 0)
+        self.assertEqual(t._kd, 0)
+        self.assertEqual(t._pid_adaptation.pending['seeded_gains'], [])
 
     async def test_nan_sensor_cannot_allow_gain_change(self):
         t, sensor, _ = self.make()

@@ -20,21 +20,25 @@ class StripImports(ast.NodeTransformer):
         return None
 
 
-def harness():
+def harness(methods=("async_added_to_hass",)):
     source = COMPONENT / "climate.py"
     tree = ast.parse(source.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SmartThermostat")
-    method = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "async_added_to_hass")
+    body = [StripImports().visit(n) for n in cls.body
+            if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name in methods]
     new_class = ast.ClassDef(name="RestoringThermostat", bases=[ast.Name(id="Base", ctx=ast.Load())],
-                             keywords=[], body=[StripImports().visit(method)], decorator_list=[], type_params=[])
+                             keywords=[], body=body, decorator_list=[], type_params=[])
     namespace = {
         "Base": Base, "callback": lambda f: f, "CoreState": SimpleNamespace(running="running"),
+        "EVENT_HOMEASSISTANT_STOP": "homeassistant_stop",
         "HVACMode": SimpleNamespace(OFF="off"), "STATE_UNKNOWN": "unknown",
         "ATTR_TEMPERATURE": "temperature", "ATTR_PRESET_MODE": "preset_mode",
         "restore_attributes": ui.restore_attributes, "_LOGGER": logging.getLogger(__name__),
         "State": lambda entity_id, state, attributes: SimpleNamespace(
             entity_id=entity_id, state=state, attributes=attributes),
         "async_track_state_change_event": Mock(return_value=Mock()),
+        "_async_listen_once_until_remove": Mock(return_value=Mock()),
+        "isfinite": __import__("math").isfinite,
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[new_class], type_ignores=[])), str(source), "exec"), namespace)
     obj = namespace["RestoringThermostat"]()
@@ -75,11 +79,12 @@ class RestoreTests(IsolatedAsyncioTestCase):
         self.assertEqual(obj._hvac_mode, "off")
         self.assertEqual(obj._sleep_temp, 20.2)
         self.assertEqual(obj._target_temp, 20.2)
-        self.assertEqual(obj._kp, 120)
+        self.assertEqual(obj._kp, 100)
 
     async def test_ui_edits_survive_actual_restore_path(self):
         obj = harness()
         obj._configured_settings = {"sleep_temp": 20.4, "kp": 90}
+        obj._kp = 90
         obj.async_get_last_state = AsyncMock(return_value=SimpleNamespace(
             entity_id=obj.entity_id, state="heat", attributes={"temperature": 21,
                 "sleep_temp": 20.2, "kp": 120, "pid_i": 50,
@@ -87,8 +92,16 @@ class RestoreTests(IsolatedAsyncioTestCase):
         await obj.async_added_to_hass()
         self.assertEqual(obj._sleep_temp, 20.4)
         self.assertEqual(obj._kp, 90)
-        self.assertEqual(obj._pid_controller.integral, 0)
+        self.assertEqual(obj._pid_controller.integral, 50)
         self.assertEqual(obj._target_temp, 21)
+
+    async def test_learning_store_can_restore_runtime_gain_without_state_attribute_restore(self):
+        obj = harness(methods=("_validated_stored_gains", "_adaptive_gains", "_learning_snapshot"))
+        obj._configured_settings = {"kp": 100}
+        obj._pid_adaptation = SimpleNamespace(limits={"kp": (10, 500), "ki": (0, 1), "kd": (0, 12000)})
+        self.assertEqual(obj._validated_stored_gains({"kp": 95, "ki": 0, "kd": 0}),
+                         {"kp": 95.0, "ki": 0.0, "kd": 0.0})
+        self.assertIsNone(obj._validated_stored_gains({"kp": 5, "ki": 0, "kd": 0}))
 
     async def test_first_ui_install_defaults_off_without_stored_state(self):
         obj = harness()
