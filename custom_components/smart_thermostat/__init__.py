@@ -1,12 +1,13 @@
 """The smart_thermostat component."""
 
 DOMAIN = "smart_thermostat"
-PLATFORMS = ["climate"]
+PLATFORMS = ["climate", "number"]
 
 
 async def async_setup_entry(hass, entry):
-    """Load the same thermostat through a UI-owned config entry."""
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    """Load the thermostat before its preset controls."""
+    await hass.config_entries.async_forward_entry_setups(entry, ["climate"])
+    await hass.config_entries.async_forward_entry_setups(entry, ["number"])
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 
@@ -16,5 +17,8 @@ async def _async_options_updated(hass, entry):
 
 
 async def async_unload_entry(hass, entry):
-    """Let entity removal cancel its subscriptions and learning tasks."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    """Unload the thermostat and its preset controls together."""
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        hass.data.get(DOMAIN, {}).get("thermostats", {}).pop(entry.entry_id, None)
+    return unloaded

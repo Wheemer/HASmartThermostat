@@ -46,6 +46,7 @@ class ModeChangeTests(unittest.IsolatedAsyncioTestCase):
             _preset_modes_temp={},
             _preset_temp_modes={},
             _preset_sync_mode="none",
+            _attr_preset_mode="none",
             min_temp=7,
             max_temp=35,
             _pwm=True,
@@ -152,6 +153,13 @@ class ModeChangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t._sleep_temp, 20)
         self.assertTrue(t._support_flags & namespace["ClimateEntityFeature"].PRESET_MODE)
         t._async_control_heating.assert_awaited_once_with(calc_pid=True)
+
+    async def test_active_preset_update_changes_live_target(self):
+        t = self.thermostat(mode="heat", active=True)
+        t._attr_preset_mode = "sleep"
+        t._target_temp = 19.5
+        await namespace["async_set_preset_temp"](t, sleep_temp=20.2)
+        self.assertEqual(t._target_temp, 20.2)
 
     async def test_disabling_last_preset_removes_preset_mode_feature(self):
         t = self.thermostat(mode="heat", active=True)

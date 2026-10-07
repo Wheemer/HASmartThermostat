@@ -197,10 +197,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
     """Set up a thermostat with the original entity identity and services."""
     configuration = entry.options.get("configuration", entry.data["configuration"])
     config = PLATFORM_SCHEMA({"platform": DOMAIN, **configuration})
-    await _async_setup_thermostat(hass, config, async_add_entities, configuration)
+    await _async_setup_thermostat(hass, config, async_add_entities, configuration, entry.entry_id)
 
 
-async def _async_setup_thermostat(hass, config, async_add_entities, configuration):
+async def _async_setup_thermostat(hass, config, async_add_entities, configuration, entry_id):
     """Share the original parameter mapping and entity service contracts."""
 
     platform = entity_platform.current_platform.get()
@@ -266,6 +266,7 @@ async def _async_setup_thermostat(hass, config, async_add_entities, configuratio
 
     smart_thermostat = SmartThermostat(**parameters)
     smart_thermostat._configured_settings = dict(configuration)
+    hass.data.setdefault(DOMAIN, {}).setdefault("thermostats", {})[entry_id] = smart_thermostat
     async_add_entities([smart_thermostat])
 
     platform.async_register_entity_service(  # type: ignore
@@ -1182,7 +1183,13 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             self._support_flags |= ClimateEntityFeature.PRESET_MODE
         else:
             self._support_flags &= ~ClimateEntityFeature.PRESET_MODE
+
+        active_preset = getattr(self, "_attr_preset_mode", PRESET_NONE)
+        active_preset_temp = getattr(self, f"_{active_preset}_temp", None)
+        if active_preset != PRESET_NONE and active_preset_temp is not None:
+            self._target_temp = active_preset_temp
         await self._async_control_heating(calc_pid=True)
+        self.async_write_ha_state()
 
     @entity_operation
     async def clear_integral(self, **kwargs):
