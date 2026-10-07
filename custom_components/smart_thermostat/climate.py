@@ -68,7 +68,7 @@ from . import DOMAIN, PLATFORMS
 from . import const
 from . import pid_controller
 from .adaptive import ThermalObserver, has_session_timing
-from .coast_control import CoastControl
+from .furnace_feedforward import FurnaceFeedForward
 from .history_learning import import_recent_history
 from .pid_adaptation import PIDAdaptation
 from .pid_units import hourly_to_seconds_id
@@ -115,9 +115,6 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(const.CONF_SENSOR): cv.entity_id,
         vol.Optional(const.CONF_OUTDOOR_SENSOR): cv.entity_id,
         vol.Optional(const.CONF_FURNACE_TEMPERATURE_SENSOR): cv.entity_id,
-        vol.Optional(const.CONF_FURNACE_TEMPERATURE_HOLD_THRESHOLD, default=40.0):
-            vol.Coerce(float),
-        vol.Optional(const.CONF_FURNACE_TEMPERATURE_CUTOFF, default=50.0): vol.Coerce(float),
         vol.Optional(const.CONF_AC_MODE): cv.boolean,
         vol.Optional(const.CONF_FORCE_OFF_STATE, default=True): cv.boolean,
         vol.Optional(const.CONF_MAX_TEMP): vol.Coerce(float),
@@ -195,7 +192,16 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up a thermostat with the original entity identity and services."""
-    configuration = entry.options.get("configuration", entry.data["configuration"])
+    configuration = dict(entry.options.get("configuration", entry.data["configuration"]))
+    # Retire both fixed furnace-temperature command thresholds.  Furnace
+    # telemetry is now a learned demand input, never a direct switch command.
+    retired = ("furnace_temperature_hold_threshold", "furnace_temperature_cutoff")
+    if any(key in configuration for key in retired):
+        for key in retired:
+            configuration.pop(key, None)
+        options = dict(entry.options)
+        options["configuration"] = configuration
+        hass.config_entries.async_update_entry(entry, options=options)
     config = PLATFORM_SCHEMA({"platform": DOMAIN, **configuration})
     await _async_setup_thermostat(hass, config, async_add_entities, configuration, entry.entry_id)
 
@@ -217,8 +223,6 @@ async def _async_setup_thermostat(hass, config, async_add_entities, configuratio
         'sensor_entity_id': config.get(const.CONF_SENSOR),
         'ext_sensor_entity_id': config.get(const.CONF_OUTDOOR_SENSOR),
         'furnace_temperature_sensor_entity_id': config.get(const.CONF_FURNACE_TEMPERATURE_SENSOR),
-        'furnace_temperature_hold_threshold': config.get(const.CONF_FURNACE_TEMPERATURE_HOLD_THRESHOLD),
-        'furnace_temperature_cutoff': config.get(const.CONF_FURNACE_TEMPERATURE_CUTOFF),
         'min_temp': config.get(const.CONF_MIN_TEMP),
         'max_temp': config.get(const.CONF_MAX_TEMP),
         'target_temp': config.get(const.CONF_TARGET_TEMP),
@@ -335,10 +339,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._ext_sensor_entity_id = kwargs.get('ext_sensor_entity_id')
         self._furnace_temperature_sensor_entity_id = kwargs.get(
             'furnace_temperature_sensor_entity_id')
-        self._furnace_temperature_hold_threshold = kwargs.get(
-            'furnace_temperature_hold_threshold')
-        self._furnace_temperature_cutoff = kwargs.get('furnace_temperature_cutoff')
         self._furnace_temperature = None
+        self._furnace_feedforward = None
+        self._furnace_response_records = []
         if self._unique_id == 'none':
             self._unique_id = slugify(f"{DOMAIN}_{self._name}_{self._heater_entity_id}")
         self._ac_mode = kwargs.get('ac_mode', False)
@@ -453,8 +456,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._adaptive_error = None
         self._observer = ThermalObserver(rise_tolerance=abs(kwargs.get('cold_tolerance'))) if (
             self._adaptive_learning_requested or kwargs.get('adaptive_observe', False)) else None
-        self._coast_control = CoastControl() if (
-            self._adaptive_learning_requested and self._observer is not None) else None
+        if self._observer is not None and self._furnace_temperature_sensor_entity_id is not None:
+            self._furnace_feedforward = FurnaceFeedForward()
         self._observer_store = None
         self._history_import_task = None
         self._output_reconcile_task = None
@@ -517,8 +520,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 saved_learning = await self._observer_store.async_load()
                 self._observer.restore(saved_learning)
                 if isinstance(saved_learning, dict):
-                    if self._coast_control is not None:
-                        self._coast_control.restore(saved_learning.get('coast_control'), time.time())
+                    saved_furnace_records = saved_learning.get('furnace_response_records')
+                    if isinstance(saved_furnace_records, list):
+                        self._furnace_response_records = saved_furnace_records
                     self._adaptive_saved = saved_learning.get('pid_adaptation')
                     self._adaptive_journal = saved_learning.get('gain_transaction')
                     self._adaptive_stored_gains = saved_learning.get('current_gains')
@@ -532,10 +536,13 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 try:
                     snapshot, report = await import_recent_history(
                         self.hass, self._sensor_entity_id, self.entity_id,
-                        self._heater_entity_id or [], dt_util.utcnow(), self._pwm)
+                        self._heater_entity_id or [], dt_util.utcnow(), self._pwm,
+                        self._furnace_temperature_sensor_entity_id)
                     # Live observations may arrive during the import. Merge, never
                     # replace them or restore a historical in-progress cycle.
                     self._observer.merge_history(snapshot['records'], report['window_start'])
+                    self._furnace_response_records = snapshot.get(
+                        'furnace_response_records', self._furnace_response_records)
                     self._observer.history_report = report
                     self._observer_store.async_delay_save(self._learning_snapshot, 1)
                     self.async_write_ha_state()
@@ -1026,19 +1033,16 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             device_state_attributes.update({
                 "furnace_temperature_sensor": self._furnace_temperature_sensor_entity_id,
                 "furnace_temperature": self._furnace_temperature,
-                "furnace_residual_heat_threshold": self._furnace_temperature_hold_threshold,
-                "furnace_heat_ceiling": self._furnace_temperature_cutoff,
-                "furnace_residual_heat_guard": self._furnace_residual_heat_active(),
-                "furnace_heat_ceiling_reached": self._furnace_heat_ceiling_reached(),
             })
         if self._configured_settings is not None:
             device_state_attributes["configured_settings"] = self._configured_settings
         if self._observer is not None:
             device_state_attributes['learning_pwm_seconds'] = self._pwm
             device_state_attributes['adaptive_learning'] = self._observer.diagnostics()
-            if getattr(self, '_coast_control', None) is not None:
-                device_state_attributes['adaptive_learning']['coast_control'] = (
-                    self._coast_control.diagnostics())
+            if self._furnace_feedforward is not None:
+                diagnostics = dict(self._furnace_feedforward.last_diagnostics)
+                diagnostics['historical_cycles'] = len(self._furnace_response_records)
+                device_state_attributes['adaptive_learning']['furnace_feedforward'] = diagnostics
             if self._adaptive_learning_requested:
                 device_state_attributes['adaptive_learning'].update(
                     mode='pid_adaptation',
@@ -1256,14 +1260,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @callback
     @entity_operation
     async def _async_furnace_temperature_changed(self, event: Event[EventStateChangedData]):
-        """Use live furnace heat to stop an excessive burn and delay a repeat call."""
-        old_guard_active = self._furnace_residual_heat_active()
+        """Record thermal telemetry; it never directly commands the furnace."""
         self._async_update_furnace_temperature(event.data["new_state"])
-        if self._furnace_heat_ceiling_reached():
-            await self._async_heater_turn_off()
-        elif old_guard_active and not self._furnace_residual_heat_active():
-            self._trigger_source = 'furnace_temperature'
-            await self._async_control_heating(calc_pid=True)
         self.async_write_ha_state()
 
     @callback
@@ -1293,9 +1291,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @callback
     def _learning_snapshot(self):
         data = self._observer.snapshot()
-        coast_control = getattr(self, '_coast_control', None)
-        if coast_control is not None:
-            data['coast_control'] = coast_control.snapshot()
+        data['furnace_response_records'] = self._furnace_response_records
         if self._pid_adaptation is not None:
             data['current_gains'] = self._adaptive_gains()
             data['pid_adaptation'] = self._pid_adaptation.snapshot()
@@ -1411,7 +1407,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 time.time(), temperature, self._target_temp, self._is_device_active, enabled,
                 {'kp': self._kp, 'ki': self._ki, 'kd': self._kd},
                 demand=self._control_output > 0 if isfinite(self._control_output) else None,
-                pwm_seconds=self._pwm)
+                pwm_seconds=self._pwm,
+                furnace_temperature=self._furnace_temperature)
             if completed and self._observer_store is not None:
                 self._observer_store.async_delay_save(self._learning_snapshot, 1)
         except (TypeError, ValueError):
@@ -1495,33 +1492,26 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self._control_output = int(self._control_output)
             self._control_output = max(min(self._control_output, self._max_out), self._min_out)
 
-            coast_control = getattr(self, '_coast_control', None)
-            if coast_control is not None:
+            furnace_feedforward = getattr(self, '_furnace_feedforward', None)
+            if furnace_feedforward is not None:
                 now = time.time()
-                coast_enabled = (
-                    self._observer is not None
-                    and self._hvac_mode == HVACMode.HEAT
-                    and not self._ac_mode
-                    and bool(self._pwm)
-                    and not self._heater_polarity_invert
-                    and self._autotune == 'none'
-                    and self.pid_mode == 'auto'
-                    and self._current_temp is not None
-                    and self._target_temp is not None
-                    and self._control_output > 0
-                )
-                if coast_control.evaluate(
-                        now, self._current_temp, self._target_temp,
-                        self._is_device_active, self._observer.records,
-                        self._min_on_cycle_duration.seconds, coast_enabled):
-                    _LOGGER.info(
-                        "%s: Learned coast control suppressing heat: %s",
-                        self.entity_id,
-                        coast_control.reason,
+                runtime = max(0.0, now - self._last_heat_cycle_time) if self._is_device_active else 0.0
+                response_records = (getattr(self, '_furnace_response_records', [])
+                                    + self._observer.records)
+                pending_rise = furnace_feedforward.pending_rise(
+                    response_records, now, runtime, self._is_device_active)
+                if pending_rise is not None and pending_rise > 0 and self._control_output > 0:
+                    # This is a feed-forward temperature-equivalent correction.
+                    # PID feedback remains based on the real room measurement,
+                    # so furnace telemetry cannot corrupt PID integral/derivative
+                    # state or command the furnace by itself.
+                    reduction = self._kp * pending_rise
+                    self._control_output = max(0, self._control_output - reduction)
+                    furnace_feedforward.last_diagnostics.update(
+                        raw_pid_output=round(self._pid_output, 3),
+                        demand_reduction_pct=round(reduction, 3),
+                        final_demand=round(self._control_output, 3),
                     )
-                    self._control_output = 0
-                    if self._observer_store is not None:
-                        self._observer_store.async_delay_save(self._learning_snapshot, 1)
 
             await self.set_control_value()
             self.async_write_ha_state()
@@ -1577,12 +1567,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         targets = self.heater_or_cooler_entity
         if not targets or any(not output_available(self.hass.states.get(entity)) for entity in targets):
             return False
-        if self._furnace_residual_heat_active():
-            _LOGGER.info(
-                "%s: Holding new heat call; furnace temperature %s is above residual-heat threshold %s",
-                self.entity_id, self._furnace_temperature,
-                self._furnace_temperature_hold_threshold)
-            return False
         if self._is_device_active:
             _LOGGER.debug("%s: %s already ON; skipping duplicate command.",
                           self.entity_id, ", ".join([entity for entity in targets]))
@@ -1611,36 +1595,16 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         return True
 
     def _async_update_furnace_temperature(self, state):
-        """Record the live furnace temperature; unknown data never causes an output command."""
+        """Record live furnace telemetry without issuing an output command."""
         if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             self._furnace_temperature = None
             return
         try:
             self._furnace_temperature = float(state.state)
+            if self._furnace_feedforward is not None:
+                self._furnace_feedforward.observe(time.time(), self._furnace_temperature)
         except (TypeError, ValueError):
             self._furnace_temperature = None
-
-    def _furnace_residual_heat_active(self):
-        """Whether retained furnace heat must block only a new heat call."""
-        return (
-            self._furnace_temperature_sensor_entity_id is not None
-            and self._furnace_temperature is not None
-            and self._furnace_temperature_hold_threshold is not None
-            and self._furnace_temperature >= self._furnace_temperature_hold_threshold
-            and self._hvac_mode == HVACMode.HEAT
-            and not self._is_device_active
-        )
-
-    def _furnace_heat_ceiling_reached(self):
-        """Whether an active burner call has heated the furnace enough to stop."""
-        return (
-            self._furnace_temperature_sensor_entity_id is not None
-            and self._furnace_temperature is not None
-            and self._furnace_temperature_cutoff is not None
-            and self._furnace_temperature >= self._furnace_temperature_cutoff
-            and self._hvac_mode == HVACMode.HEAT
-            and self._is_device_active
-        )
 
     @entity_operation
     async def _async_heater_turn_off(self, force=False):

@@ -5,11 +5,12 @@ from itertools import groupby
 from math import isfinite
 
 from .adaptive import ThermalObserver, has_session_timing
+from .furnace_history import replay_furnace_response_history
 from .thermal_response import summarize_responses
 
 
 def replay_history(history, sensor_id, climate_id, heater_ids, start, end,
-                   fallback_pwm_seconds=None):
+                   fallback_pwm_seconds=None, furnace_sensor_id=None):
     """Extract complete thermal cycles from an explicit, bounded history window.
 
     Rows have timestamp, state, attributes and optional user_id fields. Recorder
@@ -19,9 +20,14 @@ def replay_history(history, sensor_id, climate_id, heater_ids, start, end,
     current = {}
     rejected = Counter()
     required = {sensor_id, climate_id, *heater_ids}
+    tracked = set(required)
+    if furnace_sensor_id:
+        tracked.add(furnace_sensor_id)
     events = []
     if required.issubset(history):
-        for entity_id in sorted(required):
+        for entity_id in sorted(tracked):
+            if entity_id not in history:
+                continue
             rows = history[entity_id]
             prior = [row for row in rows if row['timestamp'] < start]
             if prior:
@@ -53,12 +59,23 @@ def replay_history(history, sensor_id, climate_id, heater_ids, start, end,
             observer.invalidate("stale_temperature")
             rejected["stale_temperature"] += 1
             continue
+        if climate["state"] in ("unknown", "unavailable"):
+            observer.invalidate("inactive_or_unavailable")
+            rejected["inactive_or_unavailable"] += 1
+            continue
         try:
             value = float(temperature["state"])
-            target = float(climate.get("attributes", {}).get("temperature"))
         except (ValueError, TypeError):
             observer.invalidate("invalid_temperature")
             rejected["invalid_temperature"] += 1
+            continue
+        try:
+            target = float(climate.get("attributes", {}).get("temperature"))
+        except (ValueError, TypeError):
+            # A prior thermostat implementation may have written climate states
+            # without a target. Those rows cannot establish a heat response.
+            observer.invalidate("missing_target_temperature")
+            rejected["missing_target_temperature"] += 1
             continue
         known = all(state in ("on", "off") for state in heaters)
         enabled = known and climate["state"] == "heat" and (
@@ -77,15 +94,30 @@ def replay_history(history, sensor_id, climate_id, heater_ids, start, end,
         if pwm_seconds is None and demand is not None:
             pwm_seconds = fallback_pwm_seconds
             demand_debounce_seconds = 0
+        furnace_temperature = None
+        furnace = current.get(furnace_sensor_id) if furnace_sensor_id else None
+        if furnace is not None:
+            try:
+                if furnace['state'] not in ('unknown', 'unavailable'):
+                    furnace_temperature = float(furnace['state'])
+            except (TypeError, ValueError):
+                furnace_temperature = None
         observer.sample(timestamp, value, target, any(s == "on" for s in heaters), enabled, gains, demand,
                         pwm_seconds=pwm_seconds,
-                        demand_debounce_seconds=demand_debounce_seconds)
+                        demand_debounce_seconds=demand_debounce_seconds,
+                        furnace_temperature=furnace_temperature)
         if observer.reason and observer.reason != previous_reason:
             rejected[observer.reason] += 1
-    return observer.snapshot(), {
+    snapshot = observer.snapshot()
+    furnace_report = None
+    if furnace_sensor_id:
+        records, furnace_report = replay_furnace_response_history(
+            history, sensor_id, heater_ids, furnace_sensor_id, start, end)
+        snapshot['furnace_response_records'] = records
+    report = {
         "window_start": start,
         "window_end": end,
-        "available_entities": sorted(entity for entity in required if history.get(entity)),
+        "available_entities": sorted(entity for entity in tracked if history.get(entity)),
         "completed_cycles": len(observer.records),
         "demand_sessions": sum(r.get('cycle_basis') == 'demand_session' for r in observer.records),
         "timed_demand_sessions": sum(has_session_timing(r) for r in observer.records),
@@ -95,10 +127,13 @@ def replay_history(history, sensor_id, climate_id, heater_ids, start, end,
         "confidence": "limited",
         "calibration_evidence": summarize_responses(observer.records),
     }
+    if furnace_report is not None:
+        report['furnace_response_history'] = furnace_report
+    return snapshot, report
 
 
 async def import_recent_history(hass, sensor_id, climate_id, heater_ids, end,
-                                fallback_pwm_seconds=None):
+                                fallback_pwm_seconds=None, furnace_sensor_id=None):
     """Read the last fourteen days through Recorder's own executor, day by day."""
     from datetime import timedelta
     from functools import partial
@@ -108,6 +143,8 @@ async def import_recent_history(hass, sensor_id, climate_id, heater_ids, end,
 
     start = end - timedelta(days=14)
     entities = [sensor_id, climate_id, *heater_ids]
+    if furnace_sensor_id:
+        entities.append(furnace_sensor_id)
     rows = {entity_id: [] for entity_id in entities}
     cursor = start
     while cursor < end:
@@ -131,5 +168,5 @@ async def import_recent_history(hass, sensor_id, climate_id, heater_ids, end,
         cursor = stop
     return await hass.async_add_executor_job(
         replay_history, rows, sensor_id, climate_id, heater_ids,
-        start.timestamp(), end.timestamp(), fallback_pwm_seconds,
+        start.timestamp(), end.timestamp(), fallback_pwm_seconds, furnace_sensor_id,
     )

@@ -14,7 +14,7 @@ PACKAGE = '_thermal_test'
 package = types.ModuleType(PACKAGE)
 package.__path__ = [str(ROOT)]
 sys.modules[PACKAGE] = package
-for name in ('adaptive_cycle_analysis', 'pid_cycle_metrics', 'adaptive', 'history_learning', 'coast_control',
+for name in ('adaptive_cycle_analysis', 'pid_cycle_metrics', 'adaptive', 'furnace_history', 'history_learning', 'coast_control',
              'adaptive_pid_constants', 'adaptive_pid_rules', 'pid_adaptation'):
     spec = importlib.util.spec_from_file_location(f'{PACKAGE}.{name}', ROOT / f'{name}.py')
     module = importlib.util.module_from_spec(spec)
@@ -115,6 +115,17 @@ class HistoryTests(unittest.TestCase):
         self.assertAlmostEqual(saved['records'][0]['coast'], 0.3)
         self.assertEqual(report['confidence'], 'limited')
 
+    def test_replay_captures_furnace_samples_without_making_them_required(self):
+        data = history()
+        data['sensor.furnace'] = [row(t, str(22 + min(t, 360) / 12))
+                                  for t in range(0, 1501, 30)]
+        saved, _ = replay(data, 'sensor.temp', 'climate.heat', ['switch.heat'], 0, 1500,
+                          furnace_sensor_id='sensor.furnace')
+        samples = saved['records'][0]['furnace_samples']
+        self.assertGreaterEqual(len(samples), 2)
+        self.assertGreater(samples[-1][1], samples[0][1])
+        self.assertEqual(saved['records'][0]['furnace_baseline'], samples[0][1])
+
     def test_initial_on_not_invented_cycle(self):
         data = history()
         data['switch.heat'] = [row(0, 'on'), row(360, 'off')]
@@ -184,10 +195,41 @@ class HistoryTests(unittest.TestCase):
         observer.merge_history(shifted, 0)
         self.assertEqual(len(observer.records), 1)
 
+    def test_history_replay_replaces_matching_legacy_record_with_furnace_samples(self):
+        observer = Observer()
+        record = run(history())[0]['records'][0]
+        observer.restore({'version': 1, 'records': [record]})
+        enriched = dict(record, furnace_samples=[(record['started'] + 30, 24.0),
+                                                 (record['stopped'], 50.0)])
+        observer.merge_history([enriched], 0)
+        self.assertEqual(len(observer.records), 1)
+        self.assertEqual(observer.records[0]['furnace_samples'][-1][1], 50.0)
+
     def test_invalid_temperature(self):
         data = history()
         data['sensor.temp'].append(row(210, 'nan'))
         self.assertEqual(run(data)[0]['records'], [])
+
+    def test_unavailable_climate_is_reported_without_fabricating_a_target(self):
+        data = history()
+        data['climate.heat'] = [row(0, 'unavailable')]
+        saved, report = run(data)
+        self.assertEqual(saved['records'], [])
+        self.assertGreater(report['rejections']['inactive_or_unavailable'], 0)
+
+    def test_missing_historical_target_is_reported_explicitly(self):
+        data = history()
+        data['climate.heat'] = [row(0, 'heat', pid_mode='auto')]
+        saved, report = run(data)
+        self.assertEqual(saved['records'], [])
+        self.assertGreater(report['rejections']['missing_target_temperature'], 0)
+
+    def test_furnace_sensor_is_listed_when_present(self):
+        data = history()
+        data['sensor.furnace'] = [row(0, '22')]
+        _, report = replay(data, 'sensor.temp', 'climate.heat', ['switch.heat'], 0, 1500,
+                           furnace_sensor_id='sensor.furnace')
+        self.assertIn('sensor.furnace', report['available_entities'])
 
 
 class ImportTests(unittest.IsolatedAsyncioTestCase):

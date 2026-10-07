@@ -28,8 +28,7 @@ def harness(states):
     names = {
         "_is_toggle_entity_domain", "_async_heater_turn_on", "_async_heater_turn_off",
         "_async_set_entity_value", "_async_set_valve_value", "_async_switch_changed",
-        "_async_update_furnace_temperature", "_furnace_residual_heat_active",
-        "_furnace_heat_ceiling_reached",
+        "_async_update_furnace_temperature",
     }
     methods = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
     new_cls = ast.ClassDef(name="Harness", bases=[], keywords=[], body=methods, decorator_list=[], type_params=[])
@@ -57,9 +56,8 @@ def harness(states):
     obj._min_off_cycle_duration = obj._min_on_cycle_duration = timedelta(seconds=60)
     obj._heater_polarity_invert = False
     obj._furnace_temperature_sensor_entity_id = None
-    obj._furnace_temperature_hold_threshold = 40.0
-    obj._furnace_temperature_cutoff = 50.0
     obj._furnace_temperature = None
+    obj._furnace_feedforward = None
     obj._hvac_mode = "heat"
     obj._output_min = 0
     obj._output_max = 100
@@ -95,20 +93,13 @@ class ReadinessTests(IsolatedAsyncioTestCase):
         await obj._async_heater_turn_off(force=True)
         obj.hass.services.async_call.assert_awaited_once_with("homeassistant", "turn_on", {"entity_id": "switch.heat"})
 
-    async def test_hot_furnace_blocks_a_new_heat_call(self):
+    async def test_hot_furnace_does_not_block_a_new_heat_call(self):
         obj = harness({"switch.heat": state("off")})
         obj._furnace_temperature_sensor_entity_id = "sensor.furnace"
-        obj._furnace_temperature = 45.0
+        obj._furnace_temperature = 75.0
         await obj._async_heater_turn_on()
-        obj.hass.services.async_call.assert_not_awaited()
-
-    def test_furnace_heat_ceiling_requires_an_active_heat_call(self):
-        obj = harness({"switch.heat": state("off")})
-        obj._furnace_temperature_sensor_entity_id = "sensor.furnace"
-        obj._furnace_temperature = 50.0
-        self.assertFalse(obj._furnace_heat_ceiling_reached())
-        obj._is_device_active = True
-        self.assertTrue(obj._furnace_heat_ceiling_reached())
+        obj.hass.services.async_call.assert_awaited_once_with(
+            "homeassistant", "turn_on", {"entity_id": "switch.heat"})
 
     async def test_duplicate_on_and_off_commands_are_not_replayed(self):
         obj = harness({"switch.heat": state("on")})

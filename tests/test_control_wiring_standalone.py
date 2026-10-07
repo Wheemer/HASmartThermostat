@@ -171,7 +171,9 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
             _force_off_state=True, _is_device_active=True, _pwm=900,
             _heater_polarity_invert=False, _ac_mode=False, _autotune='none', pid_mode='auto',
             _sensor_stall=0, _sampling_period=timedelta(0), _ext_temp=None,
-            _pid_output=20, _e=0, _output_precision=1, _max_out=100, _min_out=0,
+            _pid_output=20, _e=0, _output_precision=1, _max_out=100, _min_out=0, _kp=100,
+            _furnace_feedforward=None,
+            _last_heat_cycle_time=now - 180,
             _min_on_cycle_duration=timedelta(seconds=150),
             _async_heater_turn_off=AsyncMock(), set_control_value=AsyncMock(),
             async_write_ha_state=Mock(), entity_id='climate.thermostat',
@@ -183,16 +185,33 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         t._coast_control.observe_output(now - 151, True)
         return t, sensor, output
 
-    async def test_predictive_cutoff_turns_heat_off_after_minimum_on(self):
+    async def test_calibrated_furnace_heat_reduces_demand_without_actuator_rule(self):
+        t, _, _ = self.make_thermostat()
+
+        class FeedForward:
+            last_diagnostics = {'status': 'calibrated'}
+
+            def pending_rise(self, records, now, runtime_seconds, heating):
+                self.called = (records, runtime_seconds, heating)
+                return 0.3
+
+        t._pid_output = 60
+        t._furnace_feedforward = FeedForward()
+        await control_method(t)
+
+        self.assertEqual(t._control_output, 30)
+        self.assertEqual(t._furnace_feedforward.last_diagnostics['demand_reduction_pct'], 30)
+        self.assertTrue(t._furnace_feedforward.called[2])
+        t._async_heater_turn_off.assert_not_awaited()
+
+    async def test_removed_coast_suppressor_leaves_pid_demand_intact(self):
         t, _, _ = self.make_thermostat()
         await control_method(t)
         t._async_heater_turn_off.assert_not_awaited()
         t.set_control_value.assert_awaited_once()
-        self.assertEqual(t._control_output, 0)
+        self.assertEqual(t._control_output, 20)
         self.assertEqual(t._target_temp, 22)
-        t._observer_store.async_delay_save.assert_called_once()
-        self.assertTrue(t._coast_control.suppressed)
-        self.assertEqual(t._coast_control.reason, 'predicted_target_reached_after_off')
+        t._observer_store.async_delay_save.assert_not_called()
 
     async def test_explicit_off_takes_precedence(self):
         t, _, _ = self.make_thermostat()
@@ -256,19 +275,18 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         t._async_heater_turn_off.assert_not_awaited()
         self.assertEqual(t.set_control_value.await_count, 3)
 
-    async def test_predictive_hold_keeps_heat_off_while_residual_heat_settles(self):
+    async def test_removed_coast_hold_does_not_latch_heat_off(self):
         t, _, output = self.make_thermostat()
         await control_method(t)
-        self.assertEqual(t._control_output, 0)
+        self.assertEqual(t._control_output, 20)
 
         output.state = 'off'
         t._is_device_active = False
         t.set_control_value.reset_mock()
         await control_method(t)
 
-        self.assertEqual(t._control_output, 0)
+        self.assertEqual(t._control_output, 20)
         t.set_control_value.assert_awaited_once()
-        self.assertEqual(t._coast_control.reason, 'allowing_residual_heat_to_settle')
 
     async def test_control_output_respects_effective_output_max(self):
         t, _, _ = self.make_thermostat()

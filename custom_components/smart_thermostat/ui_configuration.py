@@ -6,8 +6,7 @@ from math import isfinite
 
 SECTIONS = {
     "controller": ("name", "heater", "cooler", "target_sensor", "outdoor_sensor",
-                   "furnace_temperature_sensor", "furnace_temperature_hold_threshold",
-                   "furnace_temperature_cutoff", "ac_mode", "invert_heater", "force_off_state"),
+                   "furnace_temperature_sensor", "ac_mode", "invert_heater", "force_off_state"),
     "temperatures": ("min_temp", "max_temp", "target_temp", "cold_tolerance",
                      "hot_tolerance", "precision", "target_temp_step", "initial_hvac_mode"),
     "timing": ("keep_alive", "min_cycle_duration", "min_off_cycle_duration",

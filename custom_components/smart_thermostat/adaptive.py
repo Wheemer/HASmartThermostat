@@ -39,7 +39,7 @@ class ThermalObserver:
         self.status = "waiting_for_off"
 
     def sample(self, now, temperature, target, heating, enabled=True, gains=None, demand=None,
-               pwm_seconds=None, demand_debounce_seconds=None):
+               pwm_seconds=None, demand_debounce_seconds=None, furnace_temperature=None):
         """Accept a timestamped observation; return True after a completed cycle."""
         values = (now, temperature, target)
         if not all(isinstance(v, (int, float)) and isfinite(v) for v in values):
@@ -88,6 +88,9 @@ class ThermalObserver:
                 self._cycle = {"start": now, "target": target,
                                "start_temperature": temperature,
                                "samples": [(now, temperature)],
+                               "furnace_samples": ([(now, furnace_temperature)]
+                                                   if isinstance(furnace_temperature, (int, float))
+                                                   and isfinite(furnace_temperature) else []),
                                "basis": basis, "heating": heating, "last_sample": now,
                                "pwm_seconds": pwm_seconds,
                                "runtime": 0.0,
@@ -100,6 +103,8 @@ class ThermalObserver:
             self.invalidate('cycle_sample_limit')
             return False
         cycle['samples'].append((now, temperature))
+        if isinstance(furnace_temperature, (int, float)) and isfinite(furnace_temperature):
+            cycle['furnace_samples'].append((now, furnace_temperature))
         if cycle['heating']:
             cycle['runtime'] += now - cycle['last_sample']
             if not heating:
@@ -136,7 +141,7 @@ class ThermalObserver:
         falling = temperature <= cycle["peak"] - 0.05 and now - cycle["peak_at"] >= 120
         if now - cycle["stop"] < self.settle_seconds and not falling:
             return False
-        self.records.append({
+        record = {
             'thermal_response': measure_response(cycle['samples'], cycle['on_intervals']),
             "pid_metrics": measure_cycle(cycle['samples'], cycle['target'], cycle['stop'],
                                          self.rise_tolerance),
@@ -152,7 +157,11 @@ class ThermalObserver:
             "peak": cycle["peak"],
             "coast": cycle["peak"] - cycle["stop_temperature"],
             "overshoot": max(0, cycle["peak"] - cycle["target"]),
-        })
+        }
+        if cycle['furnace_samples']:
+            record['furnace_samples'] = list(cycle['furnace_samples'])
+            record['furnace_baseline'] = cycle['furnace_samples'][0][1]
+        self.records.append(record)
         self.records = self.records[-30:]
         self._cycle = None
         self.status = "ready"
@@ -186,6 +195,10 @@ class ThermalObserver:
                 if (record.get('cycle_basis') == 'demand_session'
                         and (merged[-1].get('cycle_basis') != 'demand_session'
                              or (has_session_timing(record) and not has_session_timing(merged[-1])))):
+                    merged[-1] = record
+                elif record.get('furnace_samples') and not merged[-1].get('furnace_samples'):
+                    # Prefer the replayed copy when it adds physical furnace
+                    # telemetry to an otherwise identical completed cycle.
                     merged[-1] = record
                 continue
             merged.append(record)
