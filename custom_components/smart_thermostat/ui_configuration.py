@@ -10,8 +10,6 @@ SECTIONS = {
                    "furnace_temperature_cutoff", "ac_mode", "invert_heater", "force_off_state"),
     "temperatures": ("min_temp", "max_temp", "target_temp", "cold_tolerance",
                      "hot_tolerance", "precision", "target_temp_step", "initial_hvac_mode"),
-    "presets": ("preset_sync_mode", "away_temp", "eco_temp", "boost_temp",
-                "comfort_temp", "home_temp", "sleep_temp", "activity_temp"),
     "timing": ("keep_alive", "min_cycle_duration", "min_off_cycle_duration",
                "min_cycle_duration_pid_off", "min_off_cycle_duration_pid_off",
                "sampling_period", "sensor_stall", "pwm"),
@@ -20,12 +18,15 @@ SECTIONS = {
     "output": ("output_precision", "output_min", "output_max", "out_clamp_low",
                "out_clamp_high", "output_safety", "debug"),
 }
-FIELDS = frozenset(key for fields in SECTIONS.values() for key in fields)
-PRESETS = tuple(key for key in SECTIONS["presets"] if key.endswith("_temp"))
+PRESETS = ("away_temp", "eco_temp", "boost_temp", "comfort_temp", "home_temp",
+           "sleep_temp", "activity_temp")
+# Preset values remain import-time defaults only. Runtime ownership belongs to
+# the preset number entities, so options updates must preserve them untouched.
+FIELDS = frozenset(key for fields in SECTIONS.values() for key in fields) | set(PRESETS) | {"preset_sync_mode"}
 DURATIONS = frozenset(SECTIONS["timing"]) | {"lookback"}
 BOOLEAN_FIELDS = {"ac_mode", "invert_heater", "force_off_state", "adaptive_observe",
                   "adaptive_learning", "boost_pid_off", "debug"}
-RESTORABLE = (*PRESETS, "target_temp")
+RESTORABLE = ("target_temp",)
 
 
 def serialize_configuration(config):

@@ -37,12 +37,13 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ui.serialize_configuration({"kp": float("nan")})
 
-    def test_optional_removal_does_not_revert_to_imported_value(self):
-        result = ui.replace_section({"sleep_temp": 19.5, "away_temp": 18,
-                                     "target_sensor": "sensor.average_temperature"},
-                                    "presets", {"sleep_temp": 20.2})
-        self.assertNotIn("away_temp", result)
-        self.assertEqual(result["target_sensor"], "sensor.average_temperature")
+    def test_preset_defaults_are_preserved_outside_options_sections(self):
+        result = ui.replace_section(
+            {"sleep_temp": 19.5, "away_temp": 18, "target_sensor": "sensor.average_temperature"},
+            "temperatures", {"target_temp": 20.2},
+        )
+        self.assertEqual(result["sleep_temp"], 19.5)
+        self.assertEqual(result["away_temp"], 18)
 
     def test_section_cannot_change_identity(self):
         with self.assertRaises(ValueError):
@@ -65,16 +66,9 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result["temperature"], 22.5)
         self.assertEqual(old["temperature"], 21.5)
 
-    def test_explicit_preset_removal_does_not_restore_it(self):
+    def test_preset_attributes_are_not_overridden_by_options(self):
         old = {"configured_settings": {"sleep_temp": 19.5}, "sleep_temp": 20.2}
-        self.assertNotIn("sleep_temp", ui.restore_attributes(old, {}))
-
-    def test_removing_selected_preset_clears_selection_but_preserves_target(self):
-        old = {"configured_settings": {"sleep_temp": 19.5}, "sleep_temp": 20.2,
-               "preset_mode": "sleep", "temperature": 20.2}
-        restored = ui.restore_attributes(old, {})
-        self.assertEqual(restored["preset_mode"], "none")
-        self.assertEqual(restored["temperature"], 20.2)
+        self.assertEqual(ui.restore_attributes(old, {}), old)
 
     def test_every_existing_yaml_setting_has_a_ui_field(self):
         constants = {}
@@ -91,7 +85,10 @@ class ConfigurationTests(unittest.TestCase):
                 keys.append(constants[value.attr])
             else:
                 keys.append({"CONF_NAME": "name", "CONF_UNIQUE_ID": "unique_id"}[value.id])
-        self.assertEqual(set(keys) - {"unique_id"}, set(ui.FIELDS))
+        self.assertEqual(
+            set(keys) - {"unique_id"},
+            set(ui.FIELDS) | set(ui.PRESETS) | {"preset_sync_mode"},
+        )
 
     def test_translations_cover_every_form_and_match(self):
         strings = json.loads((COMPONENT / "strings.json").read_text())

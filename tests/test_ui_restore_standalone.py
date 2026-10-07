@@ -107,7 +107,9 @@ class RestoreTests(IsolatedAsyncioTestCase):
                 "sleep_temp": 20.2, "kp": 120, "pid_i": 50,
                 "configured_settings": {"sleep_temp": 19.5, "kp": 100}}))
         await obj.async_added_to_hass()
-        self.assertEqual(obj._sleep_temp, 20.4)
+        # The preset number entity restores this after climate startup. The
+        # climate restore path must not let options overwrite that authority.
+        self.assertEqual(obj._sleep_temp, 20.2)
         self.assertEqual(obj._kp, 90)
         self.assertEqual(obj._pid_controller.integral, 50)
         self.assertEqual(obj._target_temp, 21)

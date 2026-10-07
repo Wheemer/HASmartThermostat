@@ -141,17 +141,6 @@ class SmartThermostatOptionsFlow(config_entries.OptionsFlow):
             else:
                 return self.async_create_entry(title="", data={"configuration": validated})
         values = {key: config[key] for key in SECTIONS[section] if key in config}
-        if section == "presets":
-            registry = er.async_get(self.hass)
-            entity_id = registry.async_get_entity_id("climate", DOMAIN, config["unique_id"])
-            state = self.hass.states.get(entity_id) if entity_id else None
-            if state is not None:
-                for key in PRESETS:
-                    if key in state.attributes:
-                        if state.attributes[key] is None:
-                            values.pop(key, None)
-                        else:
-                            values[key] = state.attributes[key]
         if user_input is not None:
             values = normalize_form(user_input)
         return self.async_show_form(step_id=section,
@@ -162,9 +151,6 @@ class SmartThermostatOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_temperatures(self, user_input=None):
         return await self._section("temperatures", user_input)
-
-    async def async_step_presets(self, user_input=None):
-        return await self._section("presets", user_input)
 
     async def async_step_timing(self, user_input=None):
         return await self._section("timing", user_input)
