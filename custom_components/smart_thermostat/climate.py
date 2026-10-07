@@ -266,7 +266,11 @@ async def _async_setup_thermostat(hass, config, async_add_entities, configuratio
 
     smart_thermostat = SmartThermostat(**parameters)
     smart_thermostat._configured_settings = dict(configuration)
-    hass.data.setdefault(DOMAIN, {}).setdefault("thermostats", {})[entry_id] = smart_thermostat
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data.setdefault("thermostats", {})[entry_id] = smart_thermostat
+    ready_event = domain_data.get("ready_events", {}).get(entry_id)
+    if ready_event is not None:
+        ready_event.set()
     async_add_entities([smart_thermostat])
 
     platform.async_register_entity_service(  # type: ignore

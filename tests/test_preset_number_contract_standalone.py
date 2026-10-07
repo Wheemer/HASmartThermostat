@@ -22,6 +22,11 @@ class PresetNumberContractTests(unittest.TestCase):
                       and node.name == "async_set_native_value")
         self.assertIn("async_set_preset_temp", ast.unparse(setter))
 
+    def test_number_setup_waits_for_the_matching_thermostat(self):
+        source = SOURCE.read_text()
+        self.assertIn("asyncio.wait_for(ready_event.wait()", source)
+        self.assertIn("ConfigEntryNotReady", source)
+
 
 if __name__ == "__main__":
     unittest.main()

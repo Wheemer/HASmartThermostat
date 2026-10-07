@@ -2,22 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import slugify
 
-from . import DOMAIN
+from . import DATA_READY_EVENTS, DATA_THERMOSTATS, DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
 
 _PRESETS = ("away", "eco", "boost", "comfort", "home", "sleep", "activity")
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    """Expose the established helper-compatible preset number entities."""
-    thermostat = hass.data[DOMAIN]["thermostats"].get(entry.entry_id)
+    """Expose preset controls after the matching thermostat is ready."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    ready_event = domain_data.setdefault(DATA_READY_EVENTS, {}).get(entry.entry_id)
+    if ready_event is not None:
+        try:
+            await asyncio.wait_for(ready_event.wait(), timeout=15)
+        except TimeoutError as err:
+            raise ConfigEntryNotReady(
+                "Timed out waiting for the thermostat platform to initialize"
+            ) from err
+
+    thermostat = domain_data.setdefault(DATA_THERMOSTATS, {}).get(entry.entry_id)
     if thermostat is None:
-        return
+        raise ConfigEntryNotReady("Thermostat platform did not initialize")
+
+    _LOGGER.debug("Adding preset number entities for %s", thermostat.entity_id)
     async_add_entities([PresetTemperatureNumber(thermostat, preset) for preset in _PRESETS])
 
 

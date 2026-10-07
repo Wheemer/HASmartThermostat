@@ -141,11 +141,15 @@ class ConfigFlowTests(IsolatedAsyncioTestCase):
         manager = SimpleNamespace(async_forward_entry_setups=AsyncMock(),
                                   async_unload_platforms=AsyncMock(return_value=True),
                                   async_reload=AsyncMock())
-        hass = SimpleNamespace(config_entries=manager)
+        hass = SimpleNamespace(config_entries=manager, data={})
         self.assertTrue(await namespace["async_setup_entry"](hass, entry))
-        manager.async_forward_entry_setups.assert_awaited_once_with(entry, ["climate"])
+        manager.async_forward_entry_setups.assert_awaited_once_with(
+            entry, ["climate", "number"]
+        )
         self.assertEqual(len(registered), 1)
         await registered[0](hass, entry)
         manager.async_reload.assert_awaited_once_with("test")
         self.assertTrue(await namespace["async_unload_entry"](hass, entry))
-        manager.async_unload_platforms.assert_awaited_once_with(entry, ["climate"])
+        manager.async_unload_platforms.assert_awaited_once_with(
+            entry, ["climate", "number"]
+        )
