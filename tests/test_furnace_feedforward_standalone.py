@@ -16,6 +16,7 @@ def record(index, furnace_end=50.0, coast=0.35, runtime=240):
     start = 1_000_000 + index * 1_000
     stopped = start + runtime
     return {
+        'started': start,
         'completed': stopped + 900,
         'stopped': stopped,
         'runtime_seconds': runtime,
@@ -77,6 +78,14 @@ class FurnaceFeedForwardTests(unittest.TestCase):
             records, self.now, 50, 2.0, 90, True)
         self.assertAlmostEqual(rise, 0.35)
         self.assertEqual(diagnostics['status'], 'calibrated')
+
+    def test_active_burn_matches_same_historical_furnace_phase(self):
+        rise, diagnostics = module.predict_pending_rise(
+            self.records, self.now, 35.0, 1.0, 120, True)
+        self.assertAlmostEqual(rise, 0.35)
+        self.assertEqual(diagnostics['status'], 'calibrated_heating_phase')
+        self.assertEqual(diagnostics['strategy'], 'heating_phase')
+        self.assertEqual(diagnostics['comparable_cycles'], 6)
 
     def test_manual_coast_holds_while_furnace_and_room_are_still_rising(self):
         model = module.FurnaceFeedForward()

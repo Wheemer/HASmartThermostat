@@ -69,12 +69,70 @@ def _baseline(records, now):
     return median(candidates)
 
 
+def _furnace_temperature_at_elapsed(record, elapsed_seconds):
+    """Return the historical furnace temperature at a burn-relative time."""
+    runtime = record.get('runtime_seconds')
+    stopped = record.get('stopped')
+    started = record.get('started')
+    if not all(_finite(value) for value in (runtime, stopped, elapsed_seconds)):
+        return None
+    if not _finite(started):
+        started = stopped - runtime
+    target = min(stopped, started + max(0.0, elapsed_seconds))
+    samples = record.get('furnace_samples')
+    if not isinstance(samples, list):
+        return None
+    valid = sorted((time, value) for time, value in samples
+                   if _finite(time) and _finite(value) and time <= stopped)
+    if not valid or target < valid[0][0] or target > valid[-1][0]:
+        return None
+    previous = valid[0]
+    for following in valid[1:]:
+        if following[0] >= target:
+            if following[0] == previous[0]:
+                return following[1]
+            ratio = (target - previous[0]) / (following[0] - previous[0])
+            return previous[1] + ratio * (following[1] - previous[1])
+        previous = following
+    return valid[-1][1]
+
+
+def _phase_comparable_cycles(records, now, furnace_temperature, runtime_seconds, current_baseline):
+    """Match an active burn against historical furnace curves at the same phase."""
+    comparable = []
+    for record in records:
+        completed = record.get('completed')
+        coast = record.get('coast')
+        runtime = record.get('runtime_seconds')
+        baseline = record.get('furnace_baseline')
+        if (not all(_finite(value) for value in
+                    (completed, coast, runtime, baseline))
+                or not 0 <= now - completed <= MAX_RECORD_AGE_SECONDS
+                or runtime < MIN_RUNTIME_SECONDS or coast < 0
+                or runtime_seconds <= 0 or runtime_seconds >= runtime):
+            continue
+        historical_temperature = _furnace_temperature_at_elapsed(
+            record, runtime_seconds)
+        if historical_temperature is None:
+            continue
+        live_excess = max(0.0, furnace_temperature - current_baseline)
+        historical_excess = max(0.0, historical_temperature - baseline)
+        if historical_excess <= 0:
+            continue
+        distance = abs(live_excess - historical_excess) / max(
+            historical_excess, 1.0)
+        comparable.append((distance, coast))
+    return comparable
+
+
 def predict_pending_rise(records, now, furnace_temperature, furnace_slope,
                          runtime_seconds, heating):
     """Predict residual room rise if the current positive call ended now.
 
-    Returns ``(rise_c, diagnostics)``.  A ``None`` rise means the model is
-    deliberately inactive; the ordinary PID must be used unchanged.
+    A None rise deliberately leaves the ordinary PID unchanged. The active
+    burn branch compares the live furnace curve to the same elapsed point in
+    historical cycles, so the actual furnace temperature can reduce demand
+    before burner-off samples exist for the current call.
     """
     if not all(_finite(value) for value in (now, furnace_temperature, runtime_seconds)):
         return None, {'status': 'invalid_live_sensor'}
@@ -88,43 +146,55 @@ def predict_pending_rise(records, now, furnace_temperature, furnace_slope,
         return 0.0, {'status': 'at_rest', 'baseline_c': round(baseline, 3)}
 
     comparable = []
-    for record in records:
-        completed = record.get('completed')
-        coast = record.get('coast')
-        runtime = record.get('runtime_seconds')
-        features = _furnace_features(record)
-        if (not all(_finite(value) for value in (completed, coast, runtime))
-                or features is None or not 0 <= now - completed <= MAX_RECORD_AGE_SECONDS
-                or runtime < MIN_RUNTIME_SECONDS or coast < 0):
-            continue
-        temperature, slope = features
-        excess = max(0.0, temperature - baseline)
-        if excess <= 0:
-            continue
-        # A live call is compared only to physically similar completed burns.
-        if not 0.5 * runtime <= runtime_seconds <= 2.0 * runtime:
-            continue
-        slope_distance = abs((furnace_slope or 0.0) - slope)
-        distance = (abs(live_excess - excess) / max(excess, 1.0)
-                    + abs(runtime_seconds - runtime) / max(runtime, 1.0)
-                    + slope_distance / max(abs(slope), 0.1))
-        comparable.append((distance, coast))
+    strategy = 'burner_off'
+    if heating:
+        comparable = _phase_comparable_cycles(
+            records, now, furnace_temperature, runtime_seconds, baseline)
+        if comparable:
+            strategy = 'heating_phase'
+
     if len(comparable) < MIN_CYCLES:
-        return None, {'status': 'insufficient_comparable_cycles', 'baseline_c': round(baseline, 3),
-                      'comparable_cycles': len(comparable)}
+        comparable = []
+        for record in records:
+            completed = record.get('completed')
+            coast = record.get('coast')
+            runtime = record.get('runtime_seconds')
+            features = _furnace_features(record)
+            if (not all(_finite(value) for value in (completed, coast, runtime))
+                    or features is None or not 0 <= now - completed <= MAX_RECORD_AGE_SECONDS
+                    or runtime < MIN_RUNTIME_SECONDS or coast < 0):
+                continue
+            temperature, slope = features
+            excess = max(0.0, temperature - baseline)
+            if excess <= 0:
+                continue
+            if not 0.5 * runtime <= runtime_seconds <= 2.0 * runtime:
+                continue
+            slope_distance = abs((furnace_slope or 0.0) - slope)
+            distance = (abs(live_excess - excess) / max(excess, 1.0)
+                        + abs(runtime_seconds - runtime) / max(runtime, 1.0)
+                        + slope_distance / max(abs(slope), 0.1))
+            comparable.append((distance, coast))
+        strategy = 'burner_off'
+
+    if len(comparable) < MIN_CYCLES:
+        return None, {
+            'status': 'insufficient_comparable_cycles',
+            'baseline_c': round(baseline, 3),
+            'comparable_cycles': len(comparable),
+        }
+
     comparable.sort(key=lambda item: item[0])
-    # Conservative lower quartile: never let an unusually high coast estimate
-    # create an aggressive reduction in heat demand.
     values = sorted(coast for _, coast in comparable[:9])
     predicted = values[(len(values) - 1) // 4]
     return predicted, {
-        'status': 'calibrated',
+        'status': 'calibrated' if strategy == 'burner_off' else 'calibrated_heating_phase',
         'baseline_c': round(baseline, 3),
         'comparable_cycles': len(comparable),
         'pending_rise_c': round(predicted, 3),
         'heating': bool(heating),
+        'strategy': strategy,
     }
-
 
 class FurnaceFeedForward:
     """Stateful live sampler with a pure, conservative prediction API."""
