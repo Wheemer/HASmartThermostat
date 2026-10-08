@@ -191,6 +191,9 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         class FeedForward:
             last_diagnostics = {'status': 'calibrated'}
 
+            def manual_coast_active(self, records, now):
+                return False
+
             def pending_rise(self, records, now, runtime_seconds, heating):
                 self.called = (records, runtime_seconds, heating)
                 return 0.3

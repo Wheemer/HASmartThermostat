@@ -526,6 +526,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     self._adaptive_saved = saved_learning.get('pid_adaptation')
                     self._adaptive_journal = saved_learning.get('gain_transaction')
                     self._adaptive_stored_gains = saved_learning.get('current_gains')
+                    if self._furnace_feedforward is not None:
+                        self._furnace_feedforward.restore(
+                            saved_learning.get('furnace_feedforward_runtime'))
             except Exception:
                 self._adaptive_error = 'learning_restore_failed'
                 _LOGGER.exception("%s: Could not restore thermal observations", self.entity_id)
@@ -1279,6 +1282,17 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         if self._observer is not None and new_state is not None:
             if new_state.context.user_id is not None:
                 self._observer.invalidate("manual_output_change")
+                if (self._furnace_feedforward is not None
+                        and self._hvac_mode == HVACMode.HEAT
+                        and new_state.state == STATE_OFF):
+                    now = time.time()
+                    # A user stop begins a fresh off interval. Without this,
+                    # the prior on-time lets PWM reassert heat immediately.
+                    self._last_heat_cycle_time = now
+                    self._time_changed = now
+                    self._furnace_feedforward.begin_manual_coast(now)
+                    if self._observer_store is not None:
+                        self._observer_store.async_delay_save(self._learning_snapshot, 1)
             self._observe_temperature(self.hass.states.get(self._sensor_entity_id))
         elif self._observer is not None:
             self._observer.invalidate('output_unavailable')
@@ -1292,6 +1306,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     def _learning_snapshot(self):
         data = self._observer.snapshot()
         data['furnace_response_records'] = self._furnace_response_records
+        if self._furnace_feedforward is not None:
+            data['furnace_feedforward_runtime'] = self._furnace_feedforward.snapshot()
         if self._pid_adaptation is not None:
             data['current_gains'] = self._adaptive_gains()
             data['pid_adaptation'] = self._pid_adaptation.snapshot()
@@ -1397,6 +1413,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         """Read telemetry only. Learning failures must not interrupt furnace control."""
         try:
             temperature = float(state.state) if state is not None else None
+            if self._furnace_feedforward is not None:
+                self._furnace_feedforward.observe_room(time.time(), temperature)
             outputs = [self.hass.states.get(e) for e in self._heater_entity_id or []]
             available = bool(outputs) and all(s is not None and s.state in ('on', 'off') for s in outputs)
             fresh = state is not None and time.time() - state.last_updated.timestamp() <= self._observer.max_gap
@@ -1498,20 +1516,26 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 runtime = max(0.0, now - self._last_heat_cycle_time) if self._is_device_active else 0.0
                 response_records = (getattr(self, '_furnace_response_records', [])
                                     + self._observer.records)
-                pending_rise = furnace_feedforward.pending_rise(
-                    response_records, now, runtime, self._is_device_active)
-                if pending_rise is not None and pending_rise > 0 and self._control_output > 0:
-                    # This is a feed-forward temperature-equivalent correction.
-                    # PID feedback remains based on the real room measurement,
-                    # so furnace telemetry cannot corrupt PID integral/derivative
-                    # state or command the furnace by itself.
-                    reduction = self._kp * pending_rise
-                    self._control_output = max(0, self._control_output - reduction)
+                if furnace_feedforward.manual_coast_active(response_records, now):
                     furnace_feedforward.last_diagnostics.update(
                         raw_pid_output=round(self._pid_output, 3),
-                        demand_reduction_pct=round(reduction, 3),
-                        final_demand=round(self._control_output, 3),
+                        final_demand=0,
                     )
+                    self._control_output = 0
+                else:
+                    pending_rise = furnace_feedforward.pending_rise(
+                        response_records, now, runtime, self._is_device_active)
+                    if pending_rise is not None and pending_rise > 0 and self._control_output > 0:
+                        # This is a feed-forward temperature-equivalent correction.
+                        # PID feedback remains based on the real room measurement,
+                        # so furnace telemetry cannot corrupt PID state or command it directly.
+                        reduction = self._kp * pending_rise
+                        self._control_output = max(0, self._control_output - reduction)
+                        furnace_feedforward.last_diagnostics.update(
+                            raw_pid_output=round(self._pid_output, 3),
+                            demand_reduction_pct=round(reduction, 3),
+                            final_demand=round(self._control_output, 3),
+                        )
 
             await self.set_control_value()
             self.async_write_ha_state()
@@ -1839,7 +1863,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     await self._async_heater_turn_on()
                 self._force_off = False
         else:
-            if time_off <= time_passed or self._force_on:
+            at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
+                                and self._current_temp <= self._target_temp - self._cold_tolerance)
+            if time_off <= time_passed or self._force_on or at_cold_boundary:
                 _LOGGER.info(
                     "%s: OFF time passed. Request turning ON %s", self.entity_id,
                     ", ".join([entity for entity in self.heater_or_cooler_entity])

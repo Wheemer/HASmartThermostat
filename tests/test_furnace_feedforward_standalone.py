@@ -71,6 +71,28 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         rise, _ = module.predict_pending_rise(records, self.now, 50, 2.0, 240, True)
         self.assertAlmostEqual(rise, 0.35)
 
+    def test_ninety_second_burns_can_calibrate_the_feedforward_model(self):
+        records = [record(index, runtime=90) for index in range(6)]
+        rise, diagnostics = module.predict_pending_rise(
+            records, self.now, 50, 2.0, 90, True)
+        self.assertAlmostEqual(rise, 0.35)
+        self.assertEqual(diagnostics['status'], 'calibrated')
+
+    def test_manual_coast_holds_while_furnace_and_room_are_still_rising(self):
+        model = module.FurnaceFeedForward()
+        model.observe(1_000, 55.0)
+        model.observe(1_010, 56.0)
+        model.observe_room(1_000, 21.4)
+        model.observe_room(1_010, 21.5)
+        model.begin_manual_coast(1_005)
+        self.assertTrue(model.manual_coast_active(self.records, self.now))
+        self.assertEqual(model.last_diagnostics['status'], 'manual_coast_hold')
+
+        model.observe(1_020, 55.5)
+        model.observe_room(1_020, 21.45)
+        self.assertFalse(model.manual_coast_active(self.records, self.now))
+        self.assertEqual(model.last_diagnostics['status'], 'manual_coast_released')
+
 
 if __name__ == '__main__':
     unittest.main()
