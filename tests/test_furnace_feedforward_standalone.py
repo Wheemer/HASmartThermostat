@@ -87,20 +87,20 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         self.assertEqual(diagnostics['strategy'], 'heating_phase')
         self.assertEqual(diagnostics['comparable_cycles'], 6)
 
-    def test_manual_coast_holds_while_furnace_and_room_are_still_rising(self):
+    def test_coast_holds_while_furnace_and_room_are_still_rising(self):
         model = module.FurnaceFeedForward()
         model.observe(1_000, 55.0)
         model.observe(1_010, 56.0)
         model.observe_room(1_000, 21.4)
         model.observe_room(1_010, 21.5)
-        model.begin_manual_coast(1_005)
-        self.assertTrue(model.manual_coast_active(self.records, self.now))
-        self.assertEqual(model.last_diagnostics['status'], 'manual_coast_hold')
+        model.begin_coast(1_005)
+        self.assertTrue(model.coast_active(self.records, self.now))
+        self.assertEqual(model.last_diagnostics['status'], 'coast_hold')
 
         model.observe(1_020, 55.5)
         model.observe_room(1_020, 21.45)
-        self.assertFalse(model.manual_coast_active(self.records, self.now))
-        self.assertEqual(model.last_diagnostics['status'], 'manual_coast_released')
+        self.assertFalse(model.coast_active(self.records, self.now))
+        self.assertEqual(model.last_diagnostics['status'], 'coast_released')
 
 
 if __name__ == '__main__':

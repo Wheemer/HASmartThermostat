@@ -202,7 +202,7 @@ class FurnaceFeedForward:
     def __init__(self):
         self._samples = []
         self._room_samples = []
-        self._manual_coast_started = None
+        self._coast_started = None
         self.last_diagnostics = {'status': 'waiting_for_sensor'}
 
     def observe(self, now, temperature):
@@ -221,19 +221,20 @@ class FurnaceFeedForward:
         self._room_samples.append((now, temperature))
         self._room_samples = self._room_samples[-8:]
 
-    def begin_manual_coast(self, now):
-        """Respect a user stop until live telemetry shows stored heat is spent."""
+    def begin_coast(self, now):
+        """Begin a live residual-heat coast after a heat call ends."""
         if _finite(now):
-            self._manual_coast_started = now
+            self._coast_started = now
 
-    def manual_coast_active(self, records, now):
-        """Return whether a manual stop is still releasing useful heat.
+    def coast_active(self, records, now):
+        """Return whether the last heat call is still releasing useful heat.
 
         This is not a fixed furnace-temperature cutoff. It uses the learned
-        resting temperature plus live furnace and room slopes, so a user stop
-        cannot be immediately overwritten while heat is still reaching the home.
+        resting temperature plus live furnace and room slopes, so neither an
+        automatic nor a manual burner-off can be immediately overwritten while
+        heat is still reaching the home.
         """
-        if self._manual_coast_started is None:
+        if self._coast_started is None:
             return False
 
         furnace_temperature = self._samples[-1][1] if self._samples else None
@@ -241,8 +242,8 @@ class FurnaceFeedForward:
         room_slope = _slope(self._room_samples)
         if not _finite(furnace_temperature) or furnace_slope is None or room_slope is None:
             self.last_diagnostics = {
-                'status': 'manual_coast_waiting_for_telemetry',
-                'manual_coast_started': round(self._manual_coast_started, 3),
+                'status': 'coast_waiting_for_telemetry',
+                'coast_started': round(self._coast_started, 3),
             }
             return True
 
@@ -251,8 +252,8 @@ class FurnaceFeedForward:
         thermal_release = furnace_slope > 0 or (above_rest and room_slope > 0)
         if thermal_release:
             self.last_diagnostics = {
-                'status': 'manual_coast_hold',
-                'manual_coast_started': round(self._manual_coast_started, 3),
+                'status': 'coast_hold',
+                'coast_started': round(self._coast_started, 3),
                 'furnace_temperature_c': round(furnace_temperature, 3),
                 'furnace_slope_c_per_min': round(furnace_slope, 3),
                 'room_slope_c_per_min': round(room_slope, 3),
@@ -260,9 +261,9 @@ class FurnaceFeedForward:
             }
             return True
 
-        self._manual_coast_started = None
+        self._coast_started = None
         self.last_diagnostics = {
-            'status': 'manual_coast_released',
+            'status': 'coast_released',
             'furnace_slope_c_per_min': round(furnace_slope, 3),
             'room_slope_c_per_min': round(room_slope, 3),
             'baseline_c': round(baseline, 3) if baseline is not None else None,
@@ -270,11 +271,14 @@ class FurnaceFeedForward:
         return False
 
     def snapshot(self):
-        return {'manual_coast_started': self._manual_coast_started}
+        return {'coast_started': self._coast_started}
 
     def restore(self, data):
-        if isinstance(data, dict) and _finite(data.get('manual_coast_started')):
-            self._manual_coast_started = data['manual_coast_started']
+        if not isinstance(data, dict):
+            return
+        started = data.get('coast_started', data.get('manual_coast_started'))
+        if _finite(started):
+            self._coast_started = started
 
     def pending_rise(self, records, now, runtime_seconds, heating):
         if not self._samples:
