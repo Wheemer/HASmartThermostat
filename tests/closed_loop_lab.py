@@ -17,8 +17,7 @@ from test_initial_pid_standalone import PID, ROOT
 
 
 METHODS = ('_async_control_heating', 'calc_pid', 'set_control_value', 'pwm_switch',
-           '_is_toggle_entity_domain', '_async_heater_turn_on', '_async_heater_turn_off',
-           '_furnace_residual_heat_active')
+           '_is_toggle_entity_domain', '_async_heater_turn_on', '_async_heater_turn_off')
 
 
 def controller(gains, initial, target, *, pwm=900, minimum=150, mode='heat'):
@@ -50,7 +49,9 @@ def controller(gains, initial, target, *, pwm=900, minimum=150, mode='heat'):
                   _last_heat_cycle_time=-minimum, _force_on=False, _force_off=False, _keep_alive=True,
                   _is_device_active=False, _heater_polarity_invert=False,
                   _furnace_temperature_sensor_entity_id=None, _furnace_temperature=None,
-                  _furnace_temperature_hold_threshold=None,
+                  _furnace_feedforward=None, _furnace_response_records=[],
+                  _pwm_schedule_initialized=False, _startup_control_ready_at=0,
+                  _cold_tolerance=0.1,
                   _is_toggle_entity_domain=lambda entity: True,
                   _heater_entity_id=None if mode == 'cool' else [output_entity],
                   _cooler_entity_id=[output_entity] if mode == 'cool' else None,

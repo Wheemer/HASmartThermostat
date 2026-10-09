@@ -45,6 +45,8 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
             completed=now - 1800 + i * 200, gains=t._adaptive_gains(), cycle_basis='demand_session', pwm_seconds=900,
             pid_metrics=dict(overshoot=0.4, undershoot=0, oscillations=0, rise_time=4, settling_time=8))
             for i in range(6)]
+        t._furnace_response_records = []
+        t._furnace_feedforward = None
         t._observer_store = SimpleNamespace(async_save=AsyncMock())
         sensor = SimpleNamespace(state='22', last_updated=datetime.now(timezone.utc))
         output = SimpleNamespace(state='off')
