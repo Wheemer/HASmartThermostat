@@ -69,6 +69,27 @@ def _baseline(records, now):
     return median(candidates)
 
 
+def _learned_post_off_peak_seconds(records, now):
+    """Return the measured room-peak delay after comparable recent heat calls."""
+    values = []
+    for record in records:
+        completed = record.get('completed')
+        response = record.get('thermal_response')
+        if (not _finite(completed) or not isinstance(response, dict)
+                or response.get('version') != 1
+                or not 0 <= now - completed <= MAX_RECORD_AGE_SECONDS):
+            continue
+        peak_seconds = response.get('post_off_peak_seconds')
+        observed_seconds = response.get('post_off_observed_seconds')
+        if (not all(_finite(value) for value in (peak_seconds, observed_seconds))
+                or peak_seconds < 0 or peak_seconds > observed_seconds):
+            continue
+        values.append(peak_seconds)
+    # A single cycle is too vulnerable to an unusual door, weather, or sensor
+    # event. Three independently observed cycles give the first useful estimate.
+    return median(values) if len(values) >= 3 else None
+
+
 def _furnace_temperature_at_elapsed(record, elapsed_seconds):
     """Return the historical furnace temperature at a burn-relative time."""
     runtime = record.get('runtime_seconds')
@@ -249,6 +270,29 @@ class FurnaceFeedForward:
 
         baseline = _baseline(records, now)
         above_rest = baseline is None or furnace_temperature > baseline
+        learned_peak_seconds = _learned_post_off_peak_seconds(records, now)
+        coast_elapsed = max(0.0, now - self._coast_started)
+
+        # The room's own observed peak is the primary coast boundary. A
+        # declining furnace sensor still represents stored heat; it must not
+        # release the next call merely because the furnace has begun cooling.
+        # The live sensor may end the hold early only after the furnace has
+        # returned to its learned resting temperature and the room is no longer
+        # warming.
+        if (learned_peak_seconds is not None and coast_elapsed < learned_peak_seconds
+                and (above_rest or room_slope > 0)):
+            self.last_diagnostics = {
+                'status': 'coast_hold_learned_peak',
+                'coast_started': round(self._coast_started, 3),
+                'coast_elapsed_seconds': round(coast_elapsed, 3),
+                'learned_peak_seconds': round(learned_peak_seconds, 3),
+                'furnace_temperature_c': round(furnace_temperature, 3),
+                'furnace_slope_c_per_min': round(furnace_slope, 3),
+                'room_slope_c_per_min': round(room_slope, 3),
+                'baseline_c': round(baseline, 3) if baseline is not None else None,
+            }
+            return True
+
         thermal_release = furnace_slope > 0 or (above_rest and room_slope > 0)
         if thermal_release:
             self.last_diagnostics = {

@@ -24,6 +24,11 @@ def record(index, furnace_end=50.0, coast=0.35, runtime=240):
         'furnace_baseline': 25.0,
         'furnace_samples': [(start + 60, 25.0), (stopped - 60, furnace_end - 2),
                             (stopped, furnace_end)],
+        'thermal_response': {
+            'version': 1,
+            'post_off_peak_seconds': 300.0,
+            'post_off_observed_seconds': 900.0,
+        },
     }
 
 
@@ -87,19 +92,20 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         self.assertEqual(diagnostics['strategy'], 'heating_phase')
         self.assertEqual(diagnostics['comparable_cycles'], 6)
 
-    def test_coast_holds_while_furnace_and_room_are_still_rising(self):
+    def test_coast_holds_through_the_learned_peak_while_furnace_cools(self):
         model = module.FurnaceFeedForward()
-        model.observe(1_000, 55.0)
-        model.observe(1_010, 56.0)
-        model.observe_room(1_000, 21.4)
-        model.observe_room(1_010, 21.5)
-        model.begin_coast(1_005)
-        self.assertTrue(model.coast_active(self.records, self.now))
-        self.assertEqual(model.last_diagnostics['status'], 'coast_hold')
+        now = self.now
+        model.observe(now - 20, 56.0)
+        model.observe(now - 10, 55.0)
+        model.observe_room(now - 20, 21.4)
+        model.observe_room(now - 10, 21.35)
+        model.begin_coast(now - 15)
+        self.assertTrue(model.coast_active(self.records, now + 55))
+        self.assertEqual(model.last_diagnostics['status'], 'coast_hold_learned_peak')
 
-        model.observe(1_020, 55.5)
-        model.observe_room(1_020, 21.45)
-        self.assertFalse(model.coast_active(self.records, self.now))
+        model.observe(now + 400, 24.9)
+        model.observe_room(now + 400, 21.3)
+        self.assertFalse(model.coast_active(self.records, now + 400))
         self.assertEqual(model.last_diagnostics['status'], 'coast_released')
 
 
