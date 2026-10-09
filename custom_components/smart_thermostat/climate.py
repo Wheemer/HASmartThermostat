@@ -18,7 +18,7 @@ from homeassistant.const import (
     ATTR_TEMPERATURE,
     CONF_NAME,
     CONF_UNIQUE_ID,
-    EVENT_HOMEASSISTANT_START,
+    EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
     PRECISION_HALVES,
     PRECISION_TENTHS,
@@ -580,11 +580,11 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             if self._operations.closed:
                 return
             sensor_state = self.hass.states.get(self._sensor_entity_id)
-            if sensor_state and sensor_state.state != STATE_UNKNOWN:
+            if sensor_state and sensor_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
                 self._async_update_temp(sensor_state)
             if self._ext_sensor_entity_id is not None:
                 ext_sensor_state = self.hass.states.get(self._ext_sensor_entity_id)
-                if ext_sensor_state and ext_sensor_state.state != STATE_UNKNOWN:
+                if ext_sensor_state and ext_sensor_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
                     self._async_update_ext_temp(ext_sensor_state)
             if furnace_temperature_sensor is not None:
                 self._async_update_furnace_temperature(
@@ -594,7 +594,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             _async_startup()
         else:
             self.async_on_remove(_async_listen_once_until_remove(
-                self.hass, EVENT_HOMEASSISTANT_START, _async_startup))
+                self.hass, EVENT_HOMEASSISTANT_STARTED, _async_startup))
 
         # Add listener
         self.async_on_remove(
@@ -754,7 +754,18 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self._adaptive_error = 'pid_restore_requires_review'
                 _LOGGER.exception('%s: Adaptive gain restoration withheld', self.entity_id)
         self._restoration_complete = True
-        await self._async_control_heating(calc_pid=True)
+        # Never make the initial heat decision while Home Assistant is still
+        # assembling device states. A reload runs this immediately; a cold
+        # start waits until hardware state restoration has completed.
+        if self.hass.state == CoreState.running:
+            await self._async_control_heating(calc_pid=True)
+        else:
+            async def _async_control_after_start(*_):
+                if not self._operations.closed:
+                    await self._async_control_heating(calc_pid=True)
+
+            self.async_on_remove(_async_listen_once_until_remove(
+                self.hass, EVENT_HOMEASSISTANT_STARTED, _async_control_after_start))
 
     async def async_will_remove_from_hass(self):
         """Finish learning persistence without sending any heater commands."""
