@@ -112,20 +112,20 @@ class ConfigFlowTests(IsolatedAsyncioTestCase):
         flow.config_entry = SimpleNamespace(data={"configuration": self.config}, options={})
         return flow
 
-    async def test_options_show_effective_sleep(self):
-        result = await self.options({"sleep_temp": 20.2}).async_step_presets()
-        self.assertEqual(result["data_schema"]["values"]["sleep_temp"], 20.2)
+    async def test_options_keep_preset_controls_out_of_configuration_forms(self):
+        result = await self.options({"sleep_temp": 20.2}).async_step_temperatures()
+        self.assertNotIn("sleep_temp", result["data_schema"]["values"])
 
     async def test_options_preserve_identity_and_unrelated_fields(self):
-        result = await self.options().async_step_presets({"sleep_temp": 20.4})
+        result = await self.options().async_step_temperatures({"cold_tolerance": 0.2})
         config = result["data"]["configuration"]
         self.assertEqual(config["unique_id"], "house_thermostat")
         self.assertEqual(config["heater"], self.config["heater"])
         self.assertEqual(config["min_cycle_duration"], {"seconds": 150})
 
-    async def test_options_remove_preset_instead_of_falling_back_to_entry_data(self):
-        result = await self.options().async_step_presets({})
-        self.assertNotIn("sleep_temp", result["data"]["configuration"])
+    async def test_options_preserve_runtime_owned_presets(self):
+        result = await self.options().async_step_temperatures({})
+        self.assertEqual(result["data"]["configuration"]["sleep_temp"], 19.5)
 
     async def test_invalid_options_remain_on_form(self):
         result = await self.options().async_step_controller({"name": "Missing sensor"})

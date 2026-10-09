@@ -11,7 +11,7 @@ import sys
 from types import ModuleType
 
 
-REFERENCE = Path(__file__).resolve().parents[2] / 'adaptive-climate-review' / 'custom_components' / 'adaptive_climate'
+REFERENCE = Path(__file__).resolve().parents[1] / 'custom_components' / 'smart_thermostat' / 'reference_core'
 PACKAGE = '_reference_adaptive_compatibility'
 for name, path in ((PACKAGE, REFERENCE), (PACKAGE + '.adaptive', REFERENCE / 'adaptive')):
     if name not in sys.modules:
