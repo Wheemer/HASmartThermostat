@@ -1279,8 +1279,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @callback
     @entity_operation
     async def _async_furnace_temperature_changed(self, event: Event[EventStateChangedData]):
-        """Record thermal telemetry; it never directly commands the furnace."""
+        """Use fresh furnace telemetry in the guarded demand calculation."""
         self._async_update_furnace_temperature(event.data["new_state"])
+        if self._active and self._hvac_mode == HVACMode.HEAT:
+            # PID feedback remains based on room temperature; this pass applies
+            # feed-forward compensation through the normal PWM protections.
+            await self._async_control_heating(calc_pid=False)
         self.async_write_ha_state()
 
     @callback
@@ -1891,13 +1895,11 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                              self.entity_id,
                              ", ".join([entity for entity in self.heater_or_cooler_entity]))
                 return
-            # A restored thermostat must pass the same residual-heat guard as
-            # every normal PWM cycle before it can make its first new call.
+            # Establish PWM phase after restore: a small positive demand is
+            # not itself grounds for an immediate minimum burn.
             if initial_schedule:
-                if await self._async_heater_turn_on():
-                    self._pwm_schedule_initialized = True
-                    self._time_changed = time.time()
-                    self._force_on = False
+                self._pwm_schedule_initialized = True
+                self._force_on = False
                 return
             at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
                                 and self._current_temp <= self._target_temp - self._cold_tolerance)

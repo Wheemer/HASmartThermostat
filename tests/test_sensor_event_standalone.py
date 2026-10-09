@@ -14,7 +14,8 @@ SOURCE = Path(__file__).resolve().parents[1] / "custom_components/smart_thermost
 tree = ast.parse(SOURCE.read_text())
 thermostat = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SmartThermostat")
 methods = [n for n in thermostat.body if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
-           and n.name in ("_async_sensor_changed", "_async_update_temp")]
+           and n.name in ("_async_sensor_changed", "_async_update_temp",
+                          "_async_furnace_temperature_changed")]
 
 
 def callback(func):
@@ -27,6 +28,7 @@ class GenericStub:
 
 
 namespace = {
+    "HVACMode": SimpleNamespace(HEAT="heat"),
     "callback": callback,
     "entity_operation": lifecycle.entity_operation,
     "Event": GenericStub,
@@ -44,6 +46,9 @@ class SensorEventTests(unittest.IsolatedAsyncioTestCase):
             _operations=lifecycle.EntityOperations(),
             _observer=None,
             _previous_temp_time=10,
+            _active=True,
+            _hvac_mode="heat",
+            _async_update_furnace_temperature=Mock(),
             _cur_temp_time=20,
             _previous_temp=21.0,
             _current_temp=21.2,
@@ -83,6 +88,15 @@ class SensorEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(t._current_temp, 21.4)
         self.assertEqual(t._last_sensor_update, 1234.5)
         t._async_control_heating.assert_awaited_once_with(calc_pid=True)
+        t.async_write_ha_state.assert_called_once()
+    async def test_furnace_telemetry_recalculates_without_recomputing_pid(self):
+        t = self.thermostat()
+        event = SimpleNamespace(data={"new_state": SimpleNamespace(state="42.0")})
+
+        await namespace["_async_furnace_temperature_changed"](t, event)
+
+        t._async_update_furnace_temperature.assert_called_once_with(event.data["new_state"])
+        t._async_control_heating.assert_awaited_once_with(calc_pid=False)
         t.async_write_ha_state.assert_called_once()
 
 

@@ -140,5 +140,15 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         self.assertEqual(restored.last_diagnostics['status'], 'coast_released')
 
 
+    def test_missing_telemetry_only_holds_through_learned_peak(self):
+        model = module.FurnaceFeedForward()
+        model.begin_coast(self.now)
+
+        self.assertTrue(model.coast_active(self.records, self.now + 60))
+        self.assertEqual(model.last_diagnostics['status'], 'coast_waiting_for_telemetry')
+
+        self.assertFalse(model.coast_active(self.records, self.now + 301))
+        self.assertEqual(model.last_diagnostics['status'], 'coast_released_no_telemetry')
+
 if __name__ == '__main__':
     unittest.main()

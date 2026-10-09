@@ -269,18 +269,27 @@ class FurnaceFeedForward:
         furnace_temperature = self._samples[-1][1] if self._samples else None
         furnace_slope = _slope(self._samples)
         room_slope = _slope(self._room_samples)
-        if not _finite(furnace_temperature) or furnace_slope is None or room_slope is None:
-            self.last_diagnostics = {
-                'status': 'coast_waiting_for_telemetry',
-                'coast_started': round(self._coast_started, 3),
-            }
-            return True
-
-        baseline = _baseline(records, now)
-        above_rest = baseline is None or furnace_temperature > baseline
         learned_peak_seconds = _learned_post_off_peak_seconds(
             records, now, self._coast_runtime_seconds)
         coast_elapsed = max(0.0, now - self._coast_started)
+        if not _finite(furnace_temperature) or furnace_slope is None or room_slope is None:
+            if learned_peak_seconds is not None and coast_elapsed < learned_peak_seconds:
+                self.last_diagnostics = {
+                    'status': 'coast_waiting_for_telemetry',
+                    'coast_started': round(self._coast_started, 3),
+                    'coast_elapsed_seconds': round(coast_elapsed, 3),
+                    'learned_peak_seconds': round(learned_peak_seconds, 3),
+                }
+                return True
+            self._coast_started = None
+            self.last_diagnostics = {
+                'status': 'coast_released_no_telemetry',
+                'coast_started': None,
+            }
+            return False
+
+        baseline = _baseline(records, now)
+        above_rest = baseline is None or furnace_temperature > baseline
 
         # The room's own observed peak is the primary coast boundary. A
         # declining furnace sensor still represents stored heat; it must not

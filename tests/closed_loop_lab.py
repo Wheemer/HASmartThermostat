@@ -50,7 +50,7 @@ def controller(gains, initial, target, *, pwm=900, minimum=150, mode='heat'):
                   _is_device_active=False, _heater_polarity_invert=False,
                   _furnace_temperature_sensor_entity_id=None, _furnace_temperature=None,
                   _furnace_feedforward=None, _furnace_response_records=[],
-                  _pwm_schedule_initialized=False, _startup_control_ready_at=0,
+                  _pwm_schedule_initialized=True, _startup_control_ready_at=0,
                   _cold_tolerance=0.1,
                   _is_toggle_entity_domain=lambda entity: True,
                   _heater_entity_id=None if mode == 'cool' else [output_entity],

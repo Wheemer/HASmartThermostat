@@ -66,9 +66,10 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         await device.set_control_value()
         self.assertTrue(device._is_device_active)
 
-    async def test_startup_partial_pwm_starts_first_real_demand(self):
+    async def test_startup_partial_pwm_preserves_its_off_phase(self):
         device, clock = controller(calculate()['gains'], 20, 22)
         device._time_changed = 0
+        device._pwm_schedule_initialized = False
         device._startup_control_ready_at = 60
         device._control_output = 2
 
@@ -76,6 +77,10 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(device._is_device_active)
 
         clock.now = 61
+        await device.set_control_value()
+        self.assertFalse(device._is_device_active)
+
+        clock.now = 883
         await device.set_control_value()
         self.assertTrue(device._is_device_active)
 
