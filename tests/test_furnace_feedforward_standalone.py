@@ -12,7 +12,7 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def record(index, furnace_end=50.0, coast=0.35, runtime=240):
+def record(index, furnace_end=50.0, coast=0.35, runtime=240, peak_seconds=300.0):
     start = 1_000_000 + index * 1_000
     stopped = start + runtime
     return {
@@ -26,7 +26,8 @@ def record(index, furnace_end=50.0, coast=0.35, runtime=240):
                             (stopped, furnace_end)],
         'thermal_response': {
             'version': 1,
-            'post_off_peak_seconds': 300.0,
+            'on_seconds': runtime,
+            'post_off_peak_seconds': peak_seconds,
             'post_off_observed_seconds': 900.0,
         },
     }
@@ -107,6 +108,36 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         model.observe_room(now + 400, 21.3)
         self.assertFalse(model.coast_active(self.records, now + 400))
         self.assertEqual(model.last_diagnostics['status'], 'coast_released')
+
+    def test_coast_uses_only_similar_length_burns_for_peak_timing(self):
+        records = ([record(index, runtime=90, peak_seconds=180.0) for index in range(3)]
+                   + [record(index + 10, runtime=600, peak_seconds=900.0) for index in range(3)])
+        now = max(row['completed'] for row in records) + 60
+        model = module.FurnaceFeedForward()
+        model.observe(now - 20, 56.0)
+        model.observe(now - 10, 55.0)
+        model.observe_room(now - 20, 21.4)
+        model.observe_room(now - 10, 21.35)
+        model.begin_coast(now - 15, 90.0)
+
+        self.assertFalse(model.coast_active(records, now + 200))
+        self.assertEqual(model.last_diagnostics['status'], 'coast_released')
+
+    def test_restart_preserves_the_runtime_needed_for_comparable_coast(self):
+        records = ([record(index, runtime=90, peak_seconds=180.0) for index in range(3)]
+                   + [record(index + 10, runtime=600, peak_seconds=900.0) for index in range(3)])
+        now = max(row['completed'] for row in records) + 60
+        model = module.FurnaceFeedForward()
+        model.begin_coast(now - 15, 90.0)
+        restored = module.FurnaceFeedForward()
+        restored.restore(model.snapshot())
+        restored.observe(now - 20, 56.0)
+        restored.observe(now - 10, 55.0)
+        restored.observe_room(now - 20, 21.4)
+        restored.observe_room(now - 10, 21.35)
+
+        self.assertFalse(restored.coast_active(records, now + 200))
+        self.assertEqual(restored.last_diagnostics['status'], 'coast_released')
 
 
 if __name__ == '__main__':

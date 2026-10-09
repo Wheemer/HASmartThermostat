@@ -69,7 +69,7 @@ def _baseline(records, now):
     return median(candidates)
 
 
-def _learned_post_off_peak_seconds(records, now):
+def _learned_post_off_peak_seconds(records, now, runtime_seconds=None):
     """Return the measured room-peak delay after comparable recent heat calls."""
     values = []
     for record in records:
@@ -81,8 +81,13 @@ def _learned_post_off_peak_seconds(records, now):
             continue
         peak_seconds = response.get('post_off_peak_seconds')
         observed_seconds = response.get('post_off_observed_seconds')
+        observed_runtime = response.get('on_seconds', record.get('runtime_seconds'))
         if (not all(_finite(value) for value in (peak_seconds, observed_seconds))
                 or peak_seconds < 0 or peak_seconds > observed_seconds):
+            continue
+        if (_finite(runtime_seconds) and runtime_seconds > 0
+                and (not _finite(observed_runtime)
+                     or not 0.5 * runtime_seconds <= observed_runtime <= 2.0 * runtime_seconds)):
             continue
         values.append(peak_seconds)
     # A single cycle is too vulnerable to an unusual door, weather, or sensor
@@ -224,6 +229,7 @@ class FurnaceFeedForward:
         self._samples = []
         self._room_samples = []
         self._coast_started = None
+        self._coast_runtime_seconds = None
         self.last_diagnostics = {'status': 'waiting_for_sensor'}
 
     def observe(self, now, temperature):
@@ -242,10 +248,12 @@ class FurnaceFeedForward:
         self._room_samples.append((now, temperature))
         self._room_samples = self._room_samples[-8:]
 
-    def begin_coast(self, now):
+    def begin_coast(self, now, runtime_seconds=None):
         """Begin a live residual-heat coast after a heat call ends."""
         if _finite(now):
             self._coast_started = now
+            self._coast_runtime_seconds = runtime_seconds if (
+                _finite(runtime_seconds) and runtime_seconds > 0) else None
 
     def coast_active(self, records, now):
         """Return whether the last heat call is still releasing useful heat.
@@ -270,7 +278,8 @@ class FurnaceFeedForward:
 
         baseline = _baseline(records, now)
         above_rest = baseline is None or furnace_temperature > baseline
-        learned_peak_seconds = _learned_post_off_peak_seconds(records, now)
+        learned_peak_seconds = _learned_post_off_peak_seconds(
+            records, now, self._coast_runtime_seconds)
         coast_elapsed = max(0.0, now - self._coast_started)
 
         # The room's own observed peak is the primary coast boundary. A
@@ -315,7 +324,10 @@ class FurnaceFeedForward:
         return False
 
     def snapshot(self):
-        return {'coast_started': self._coast_started}
+        return {
+            'coast_started': self._coast_started,
+            'coast_runtime_seconds': self._coast_runtime_seconds,
+        }
 
     def restore(self, data):
         if not isinstance(data, dict):
@@ -323,6 +335,9 @@ class FurnaceFeedForward:
         started = data.get('coast_started', data.get('manual_coast_started'))
         if _finite(started):
             self._coast_started = started
+        runtime_seconds = data.get('coast_runtime_seconds')
+        if _finite(runtime_seconds) and runtime_seconds > 0:
+            self._coast_runtime_seconds = runtime_seconds
 
     def pending_rise(self, records, now, runtime_seconds, heating):
         if not self._samples:

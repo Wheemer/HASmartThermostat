@@ -641,6 +641,11 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         @callback
         def _async_shutdown(_event: Event) -> None:
             """Persist intent, then stop heat before service teardown."""
+            if (self._is_device_active and self._furnace_feedforward is not None
+                    and self._hvac_mode == HVACMode.HEAT):
+                now = time.time()
+                self._furnace_feedforward.begin_coast(
+                    now, max(0.0, now - self._last_heat_cycle_time))
             self._save_runtime_snapshot()
             self.hass.async_create_task(
                 self._async_turn_off_heaters_for_shutdown(),
@@ -1286,11 +1291,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                         and self._hvac_mode == HVACMode.HEAT
                         and new_state.state == STATE_OFF):
                     now = time.time()
+                    runtime = max(0.0, now - self._last_heat_cycle_time)
                     # A user stop begins a fresh off interval. Without this,
                     # the prior on-time lets PWM reassert heat immediately.
                     self._last_heat_cycle_time = now
                     self._time_changed = now
-                    self._furnace_feedforward.begin_coast(now)
+                    self._furnace_feedforward.begin_coast(now, runtime)
                     if self._observer_store is not None:
                         self._observer_store.async_delay_save(self._learning_snapshot, 1)
             self._observe_temperature(self.hass.states.get(self._sensor_entity_id))
@@ -1633,6 +1639,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @entity_operation
     async def _async_heater_turn_off(self, force=False):
         """Turn heater toggleable device off."""
+        cycle_runtime = None
         if getattr(self, '_hvac_mode', None) == 'off':
             targets = (self._heater_entity_id or []) + (self._cooler_entity_id or [])
         else:
@@ -1644,6 +1651,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                           self.entity_id, ", ".join([entity for entity in self.heater_or_cooler_entity]))
             return True
         elif time.time() - self._last_heat_cycle_time >= self._min_on_cycle_duration.seconds or force:
+            cycle_runtime = max(0.0, time.time() - self._last_heat_cycle_time)
             _LOGGER.info("%s: Turning OFF %s", self.entity_id,
                          ", ".join([entity for entity in self.heater_or_cooler_entity]))
             self._last_heat_cycle_time = time.time()
@@ -1671,7 +1679,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             command_sent = True
         if (command_sent and not force and self._furnace_feedforward is not None
                 and self._hvac_mode == HVACMode.HEAT):
-            self._furnace_feedforward.begin_coast(time.time())
+            self._furnace_feedforward.begin_coast(time.time(), cycle_runtime)
             if self._observer_store is not None:
                 self._observer_store.async_delay_save(self._learning_snapshot, 1)
         return command_sent
@@ -1837,16 +1845,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             # a mathematically preserved duty cycle with an hours-long on phase.
             time_on = self._pwm
             time_off = 0
-        # A restart has no legitimate PWM phase to resume: Home Assistant has
-        # already stopped the physical output for shutdown safety. Start the
-        # first real demand after the normal minimum-off guard instead of
-        # inventing an initial off window from the new process timestamp.
-        if not getattr(self, '_pwm_schedule_initialized', False) and not self._is_device_active:
-            if await self._async_heater_turn_on():
-                self._pwm_schedule_initialized = True
-                self._time_changed = time.time()
-                self._force_on = False
-            return
+        initial_schedule = (not getattr(self, '_pwm_schedule_initialized', False)
+                            and not self._is_device_active)
         if self._is_device_active:
             if time_on <= time_passed or self._force_off:
                 _LOGGER.info(
@@ -1879,6 +1879,14 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 _LOGGER.info("%s: Residual heat is still reaching the home; holding %s OFF",
                              self.entity_id,
                              ", ".join([entity for entity in self.heater_or_cooler_entity]))
+                return
+            # A restored thermostat must pass the same residual-heat guard as
+            # every normal PWM cycle before it can make its first new call.
+            if initial_schedule:
+                if await self._async_heater_turn_on():
+                    self._pwm_schedule_initialized = True
+                    self._time_changed = time.time()
+                    self._force_on = False
                 return
             at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
                                 and self._current_temp <= self._target_temp - self._cold_tolerance)
