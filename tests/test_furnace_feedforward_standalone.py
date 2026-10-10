@@ -109,6 +109,23 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         self.assertFalse(model.coast_active(self.records, now + 400))
         self.assertEqual(model.last_diagnostics['status'], 'coast_released')
 
+    def test_coast_holds_when_a_hot_furnace_has_started_cooling(self):
+        model = module.FurnaceFeedForward()
+        now = self.now
+        records = [dict(row, thermal_response={}) for row in self.records]
+        model.observe(now - 10, 27.0)
+        model.observe_room(now - 10, 21.5)
+        model.begin_coast(now, 90.0)
+
+        # This is the failure mode from the live system: a short burn ends,
+        # the furnace continues to climb, then has only just started cooling.
+        model.observe(now + 150, 34.8)
+        model.observe_room(now + 150, 21.5)
+        self.assertTrue(model.coast_active(records, now + 150))
+        self.assertEqual(
+            model.last_diagnostics['status'],
+            'coast_hold_remaining_furnace_energy')
+
     def test_coast_uses_only_similar_length_burns_for_peak_timing(self):
         records = ([record(index, runtime=90, peak_seconds=180.0) for index in range(3)]
                    + [record(index + 10, runtime=600, peak_seconds=900.0) for index in range(3)])

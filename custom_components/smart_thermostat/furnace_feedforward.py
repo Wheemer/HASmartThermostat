@@ -14,6 +14,7 @@ from statistics import median
 MIN_CYCLES = 6
 MAX_RECORD_AGE_SECONDS = 14 * 86400
 MIN_RUNTIME_SECONDS = 60
+COAST_REMAINING_ENERGY_FRACTION = 0.15
 
 
 def _finite(value):
@@ -230,6 +231,7 @@ class FurnaceFeedForward:
         self._room_samples = []
         self._coast_started = None
         self._coast_runtime_seconds = None
+        self._coast_peak_temperature = None
         self.last_diagnostics = {'status': 'waiting_for_sensor'}
 
     def observe(self, now, temperature):
@@ -254,6 +256,8 @@ class FurnaceFeedForward:
             self._coast_started = now
             self._coast_runtime_seconds = runtime_seconds if (
                 _finite(runtime_seconds) and runtime_seconds > 0) else None
+            self._coast_peak_temperature = (
+                self._samples[-1][1] if self._samples else None)
 
     def coast_active(self, records, now):
         """Return whether the last heat call is still releasing useful heat.
@@ -291,6 +295,29 @@ class FurnaceFeedForward:
         baseline = _baseline(records, now)
         above_rest = baseline is None or furnace_temperature > baseline
 
+        # A declining furnace sensor still represents stored heat. Keep the
+        # post-burn hold until the live excess above this cycle's resting
+        # baseline has materially decayed from its observed peak.
+        if _finite(furnace_temperature):
+            if (not _finite(self._coast_peak_temperature)
+                    or furnace_temperature > self._coast_peak_temperature):
+                self._coast_peak_temperature = furnace_temperature
+        if (learned_peak_seconds is None and _finite(baseline)
+                and _finite(self._coast_peak_temperature)
+                and self._coast_peak_temperature > baseline):
+            peak_excess = self._coast_peak_temperature - baseline
+            remaining_excess = max(0.0, furnace_temperature - baseline)
+            if remaining_excess >= peak_excess * COAST_REMAINING_ENERGY_FRACTION:
+                self.last_diagnostics = {
+                    'status': 'coast_hold_remaining_furnace_energy',
+                    'coast_started': round(self._coast_started, 3),
+                    'furnace_temperature_c': round(furnace_temperature, 3),
+                    'furnace_peak_c': round(self._coast_peak_temperature, 3),
+                    'baseline_c': round(baseline, 3),
+                    'remaining_energy_fraction': round(remaining_excess / peak_excess, 3),
+                }
+                return True
+
         # The room's own observed peak is the primary coast boundary. A
         # declining furnace sensor still represents stored heat; it must not
         # release the next call merely because the furnace has begun cooling.
@@ -324,6 +351,7 @@ class FurnaceFeedForward:
             return True
 
         self._coast_started = None
+        self._coast_peak_temperature = None
         self.last_diagnostics = {
             'status': 'coast_released',
             'furnace_slope_c_per_min': round(furnace_slope, 3),
@@ -336,6 +364,7 @@ class FurnaceFeedForward:
         return {
             'coast_started': self._coast_started,
             'coast_runtime_seconds': self._coast_runtime_seconds,
+            'coast_peak_temperature': self._coast_peak_temperature,
         }
 
     def restore(self, data):
@@ -347,6 +376,9 @@ class FurnaceFeedForward:
         runtime_seconds = data.get('coast_runtime_seconds')
         if _finite(runtime_seconds) and runtime_seconds > 0:
             self._coast_runtime_seconds = runtime_seconds
+        peak_temperature = data.get('coast_peak_temperature')
+        if _finite(peak_temperature):
+            self._coast_peak_temperature = peak_temperature
 
     def pending_rise(self, records, now, runtime_seconds, heating):
         if not self._samples:
