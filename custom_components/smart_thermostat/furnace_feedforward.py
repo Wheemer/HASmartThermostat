@@ -259,6 +259,32 @@ class FurnaceFeedForward:
             self._coast_peak_temperature = (
                 self._samples[-1][1] if self._samples else None)
 
+    def resume_coast_from_live_furnace_heat(self, records, now):
+        """Rebuild a lost coast marker from live, measured residual heat.
+
+        This is used only after a reload while the physical heat output is
+        already off. It requires a learned resting baseline and never acts as
+        an actuator threshold: it only restores the normal coast guard until
+        the measured furnace energy has dissipated.
+        """
+        if self._coast_started is not None or not _finite(now):
+            return False
+        furnace_temperature = self._samples[-1][1] if self._samples else None
+        baseline = _baseline(records, now)
+        if (not _finite(furnace_temperature) or not _finite(baseline)
+                or furnace_temperature <= baseline):
+            return False
+        self._coast_started = now
+        self._coast_runtime_seconds = None
+        self._coast_peak_temperature = furnace_temperature
+        self.last_diagnostics = {
+            'status': 'coast_resumed_from_live_furnace_heat',
+            'coast_started': round(now, 3),
+            'furnace_temperature_c': round(furnace_temperature, 3),
+            'baseline_c': round(baseline, 3),
+        }
+        return True
+
     def coast_active(self, records, now):
         """Return whether the last heat call is still releasing useful heat.
 

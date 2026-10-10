@@ -162,6 +162,31 @@ class FurnaceFeedForwardTests(unittest.TestCase):
             restored.last_diagnostics['status'],
             'coast_hold_remaining_furnace_energy')
 
+    def test_reload_rebuilds_coast_from_live_furnace_heat_when_marker_is_missing(self):
+        model = module.FurnaceFeedForward()
+        model.observe(self.now, 34.4)
+
+        self.assertTrue(model.resume_coast_from_live_furnace_heat(
+            self.records, self.now))
+        self.assertEqual(
+            model.last_diagnostics['status'],
+            'coast_resumed_from_live_furnace_heat')
+
+        model.observe(self.now + 30, 34.0)
+        model.observe_room(self.now, 21.0)
+        model.observe_room(self.now + 30, 21.0)
+        self.assertTrue(model.coast_active(self.records, self.now + 30))
+        self.assertEqual(
+            model.last_diagnostics['status'],
+            'coast_hold_remaining_furnace_energy')
+
+    def test_reload_does_not_create_coast_at_or_below_resting_temperature(self):
+        model = module.FurnaceFeedForward()
+        model.observe(self.now, 25.0)
+
+        self.assertFalse(model.resume_coast_from_live_furnace_heat(
+            self.records, self.now))
+
 
     def test_missing_telemetry_only_holds_through_learned_peak(self):
         model = module.FurnaceFeedForward()

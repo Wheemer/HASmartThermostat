@@ -589,6 +589,13 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             if furnace_temperature_sensor is not None:
                 self._async_update_furnace_temperature(
                     self.hass.states.get(furnace_temperature_sensor))
+                outputs = [self.hass.states.get(entity)
+                           for entity in self._heater_entity_id or []]
+                if (self._furnace_feedforward is not None and outputs
+                        and all(output_available(state)
+                                and state.state == STATE_OFF for state in outputs)):
+                    self._furnace_feedforward.resume_coast_from_live_furnace_heat(
+                        self._furnace_response_records, time.time())
 
         if self.hass.state == CoreState.running:
             _async_startup()
