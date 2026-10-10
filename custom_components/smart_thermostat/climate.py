@@ -1547,7 +1547,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 runtime = max(0.0, now - self._last_heat_cycle_time) if self._is_device_active else 0.0
                 response_records = (getattr(self, '_furnace_response_records', [])
                                     + self._observer.records)
-                if furnace_feedforward.coast_active(response_records, now):
+                at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
+                                    and self._current_temp <= self._target_temp - self._cold_tolerance)
+                if furnace_feedforward.coast_active(response_records, now) and not at_cold_boundary:
                     furnace_feedforward.last_diagnostics.update(
                         raw_pid_output=round(self._pid_output, 3),
                         final_demand=0,
@@ -1556,7 +1558,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 else:
                     pending_rise = furnace_feedforward.pending_rise(
                         response_records, now, runtime, self._is_device_active)
-                    if pending_rise is not None and pending_rise > 0 and self._control_output > 0:
+                    if (pending_rise is not None and pending_rise > 0
+                            and self._control_output > 0
+                            and (self._is_device_active or not at_cold_boundary)):
                         # This is a feed-forward temperature-equivalent correction.
                         # PID feedback remains based on the real room measurement,
                         # so furnace telemetry cannot corrupt PID state or command it directly.
@@ -1839,7 +1843,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             if abs(self._control_output) == self._difference:
                 if not self._is_device_active:
                     furnace_feedforward = getattr(self, '_furnace_feedforward', None)
-                    if furnace_feedforward is not None:
+                    at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
+                                        and self._current_temp <= self._target_temp - self._cold_tolerance)
+                    if furnace_feedforward is not None and not at_cold_boundary:
                         response_records = (
                             getattr(self, '_furnace_response_records', [])
                             + (self._observer.records if self._observer is not None else []))
@@ -1905,6 +1911,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     await self._async_heater_turn_on()
                 self._force_off = False
         else:
+            at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
+                                and self._current_temp <= self._target_temp - self._cold_tolerance)
             coast_active = False
             furnace_feedforward = getattr(self, '_furnace_feedforward', None)
             if furnace_feedforward is not None:
@@ -1912,7 +1920,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                                     + self._observer.records)
                 coast_active = furnace_feedforward.coast_active(
                     response_records, time.time())
-            if coast_active:
+            if coast_active and not at_cold_boundary:
                 _LOGGER.info("%s: Residual heat is still reaching the home; holding %s OFF",
                              self.entity_id,
                              ", ".join([entity for entity in self.heater_or_cooler_entity]))
@@ -1923,8 +1931,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self._pwm_schedule_initialized = True
                 self._force_on = False
                 return
-            at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
-                                and self._current_temp <= self._target_temp - self._cold_tolerance)
             if time_off <= time_passed or self._force_on or at_cold_boundary:
                 _LOGGER.info(
                     "%s: OFF time passed. Request turning ON %s", self.entity_id,

@@ -168,6 +168,7 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
             hass=SimpleNamespace(states=SimpleNamespace(get=lambda e: sensor if e == 'sensor.temp' else output)),
             _sensor_entity_id='sensor.temp', _heater_entity_id=['switch.heat'],
             _active=True, _hvac_mode='heat', _current_temp=21.8, _target_temp=22,
+            _cold_tolerance=0.1,
             _force_off_state=True, _is_device_active=True, _pwm=900,
             _heater_polarity_invert=False, _ac_mode=False, _autotune='none', pid_mode='auto',
             _sensor_stall=0, _sampling_period=timedelta(0), _ext_temp=None,
