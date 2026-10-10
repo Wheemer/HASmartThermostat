@@ -1,4 +1,4 @@
-"""Tests for the measured post-off furnace residual-heat guard."""
+"""Tests for the single-boundary furnace residual-heat interlock."""
 
 import importlib.util
 from pathlib import Path
@@ -21,75 +21,77 @@ class FurnaceResidualHeatGuardTests(unittest.TestCase):
         self.records = [record(index) for index in range(6)]
         self.now = max(row['completed'] for row in self.records) + 60
 
-    def test_guard_has_no_predictive_pid_api(self):
+    def test_guard_has_only_pre_fire_api(self):
         guard = module.FurnaceFeedForward()
-        self.assertFalse(hasattr(guard, 'pending_rise'))
-        self.assertFalse(hasattr(guard, 'turn_off'))
+        self.assertTrue(hasattr(guard, 'blocks_new_heat_call'))
+        self.assertFalse(hasattr(guard, 'coast_active'))
+        self.assertFalse(hasattr(guard, 'observe_room'))
+        self.assertFalse(hasattr(guard, 'resume_coast_from_live_furnace_heat'))
 
-    def test_rising_furnace_temperature_blocks_immediate_refire(self):
+    def test_rising_furnace_blocks_new_heat_call(self):
         guard = module.FurnaceFeedForward()
-        guard.observe(self.now - 30, 31.0)
-        guard.observe(self.now, 34.4)
-        guard.observe_room(self.now - 30, 21.0)
-        guard.observe_room(self.now, 21.0)
-        guard.begin_coast(self.now - 1)
+        guard.observe(self.now - 30, 47.6)
+        guard.begin_coast(self.now - 30)
+        guard.observe(self.now, 51.2)
 
-        self.assertTrue(guard.coast_active(self.records, self.now))
-        self.assertEqual(
-            guard.last_diagnostics['status'], 'coast_hold_stored_furnace_heat')
+        self.assertTrue(guard.blocks_new_heat_call(self.records, self.now))
+        self.assertEqual(guard.last_diagnostics['status'], 'coast_hold_stored_furnace_heat')
 
-    def test_falling_but_still_hot_furnace_blocks_immediate_refire(self):
+    def test_actual_rapid_refire_trace_remains_blocked_while_furnace_is_hot(self):
+        """Replay the observed 47.6 -> 51.2 -> 50.8 C rapid-refire sequence."""
         guard = module.FurnaceFeedForward()
-        guard.observe(self.now - 30, 36.0)
-        guard.observe(self.now, 34.0)
-        guard.observe_room(self.now - 30, 21.0)
-        guard.observe_room(self.now, 21.0)
-        guard.begin_coast(self.now - 1)
+        guard.observe(self.now - 102, 47.6)
+        guard.begin_coast(self.now - 102)
+        guard.observe(self.now - 60, 51.2)
+        guard.observe(self.now, 50.8)
 
-        self.assertTrue(guard.coast_active(self.records, self.now))
-        self.assertEqual(
-            guard.last_diagnostics['status'], 'coast_hold_stored_furnace_heat')
+        self.assertTrue(guard.blocks_new_heat_call(self.records, self.now))
+        self.assertEqual(guard.last_diagnostics['furnace_temperature_c'], 50.8)
 
-    def test_guard_releases_only_after_furnace_returns_to_resting_baseline(self):
+    def test_guard_releases_after_measured_energy_has_mostly_dissipated(self):
         guard = module.FurnaceFeedForward()
-        guard.observe(self.now - 30, 25.4)
-        guard.observe(self.now, 25.0)
-        guard.observe_room(self.now - 30, 21.1)
-        guard.observe_room(self.now, 21.0)
-        guard.begin_coast(self.now - 1)
+        guard.observe(self.now - 60, 47.6)
+        guard.begin_coast(self.now - 60)
+        guard.observe(self.now - 30, 51.2)
+        guard.observe(self.now, 27.0)
 
-        self.assertFalse(guard.coast_active(self.records, self.now))
+        self.assertFalse(guard.blocks_new_heat_call(self.records, self.now))
         self.assertEqual(guard.last_diagnostics['status'], 'coast_released')
 
-    def test_missing_telemetry_does_not_hold_heat_off(self):
+    def test_missing_telemetry_never_changes_pid_or_latches_off(self):
         guard = module.FurnaceFeedForward()
         guard.begin_coast(self.now)
 
-        self.assertFalse(guard.coast_active(self.records, self.now + 1))
+        self.assertFalse(guard.blocks_new_heat_call(self.records, self.now + 1))
         self.assertEqual(guard.last_diagnostics['status'], 'coast_unverified')
 
-    def test_restart_marker_uses_new_live_measurements(self):
+    def test_warm_furnace_at_startup_does_not_invent_a_coast(self):
+        guard = module.FurnaceFeedForward()
+        guard.observe(self.now - 30, 50.0)
+        guard.observe(self.now, 49.0)
+
+        self.assertFalse(guard.blocks_new_heat_call(self.records, self.now))
+
+    def test_explicit_coast_snapshot_survives_restart_only_until_checked(self):
         original = module.FurnaceFeedForward()
-        original.observe(self.now - 1, 47.6)
-        original.begin_coast(self.now - 1)
+        original.observe(self.now - 60, 47.6)
+        original.begin_coast(self.now - 60)
         restored = module.FurnaceFeedForward()
         restored.restore(original.snapshot())
-        restored.observe(self.now - 30, 31.0)
-        restored.observe(self.now, 34.4)
-        restored.observe_room(self.now - 30, 21.0)
-        restored.observe_room(self.now, 21.0)
+        restored.observe(self.now - 30, 51.2)
+        restored.observe(self.now, 50.8)
 
-        self.assertTrue(restored.coast_active(self.records, self.now))
-        self.assertEqual(restored.snapshot()['coast_peak_temperature'], 47.6)
+        self.assertTrue(restored.blocks_new_heat_call(self.records, self.now))
 
-    def test_reload_resumes_guard_only_above_learned_baseline(self):
+    def test_coast_cannot_latch_indefinitely(self):
         guard = module.FurnaceFeedForward()
-        guard.observe(self.now, 34.4)
-        self.assertTrue(guard.resume_coast_from_live_furnace_heat(self.records, self.now))
+        guard.observe(self.now - 1900, 47.6)
+        guard.begin_coast(self.now - 1900)
+        guard.observe(self.now - 30, 51.2)
+        guard.observe(self.now, 50.8)
 
-        at_rest = module.FurnaceFeedForward()
-        at_rest.observe(self.now, 25.0)
-        self.assertFalse(at_rest.resume_coast_from_live_furnace_heat(self.records, self.now))
+        self.assertFalse(guard.blocks_new_heat_call(self.records, self.now))
+        self.assertEqual(guard.last_diagnostics['status'], 'coast_expired')
 
 
 if __name__ == '__main__':

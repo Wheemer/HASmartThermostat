@@ -456,7 +456,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._adaptive_error = None
         self._observer = ThermalObserver(rise_tolerance=abs(kwargs.get('cold_tolerance'))) if (
             self._adaptive_learning_requested or kwargs.get('adaptive_observe', False)) else None
-        if self._observer is not None and self._furnace_temperature_sensor_entity_id is not None:
+        if self._furnace_temperature_sensor_entity_id is not None:
             self._furnace_feedforward = FurnaceFeedForward()
         self._observer_store = None
         self._history_import_task = None
@@ -588,13 +588,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             if furnace_temperature_sensor is not None:
                 self._async_update_furnace_temperature(
                     self.hass.states.get(furnace_temperature_sensor))
-                outputs = [self.hass.states.get(entity)
-                           for entity in self._heater_entity_id or []]
-                if (self._furnace_feedforward is not None and outputs
-                        and all(output_available(state)
-                                and state.state == STATE_OFF for state in outputs)):
-                    self._furnace_feedforward.resume_coast_from_live_furnace_heat(
-                        self._furnace_response_records, time.time())
 
         if self.hass.state == CoreState.running:
             _async_startup()
@@ -647,10 +640,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         @callback
         def _async_shutdown(_event: Event) -> None:
             """Persist intent, then stop heat before service teardown."""
-            if (self._is_device_active and self._furnace_feedforward is not None
-                    and self._hvac_mode == HVACMode.HEAT):
-                now = time.time()
-                self._furnace_feedforward.begin_coast(now)
             self._save_runtime_snapshot()
             self.hass.async_create_task(
                 self._async_turn_off_heaters_for_shutdown(),
@@ -789,7 +778,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 await asyncio.gather(reconcile, return_exceptions=True)
             if self._history_import_task is not None:
                 await asyncio.gather(self._history_import_task, return_exceptions=True)
-            if self._observer_store is not None:
+            if getattr(self, '_observer_store', None) is not None:
                 await self._observer_store.async_save(self._learning_snapshot())
         except Exception:
             _LOGGER.exception("%s: Could not persist learning during unload", self.entity_id)
@@ -1310,17 +1299,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         if self._observer is not None and new_state is not None:
             if new_state.context.user_id is not None:
                 self._observer.invalidate("manual_output_change")
-                if (self._furnace_feedforward is not None
-                        and self._hvac_mode == HVACMode.HEAT
-                        and new_state.state == STATE_OFF):
-                    now = time.time()
-                    # A user stop begins a fresh off interval. Without this,
-                    # the prior on-time lets PWM reassert heat immediately.
-                    self._last_heat_cycle_time = now
-                    self._time_changed = now
-                    self._furnace_feedforward.begin_coast(now)
-                    if self._observer_store is not None:
-                        self._observer_store.async_delay_save(self._learning_snapshot, 1)
             self._observe_temperature(self.hass.states.get(self._sensor_entity_id))
         elif self._observer is not None:
             self._observer.invalidate('output_unavailable')
@@ -1332,7 +1310,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
 
     @callback
     def _learning_snapshot(self):
-        data = self._observer.snapshot()
+        data = self._observer.snapshot() if self._observer is not None else {}
         data['furnace_response_records'] = self._furnace_response_records
         if self._furnace_feedforward is not None:
             data['furnace_feedforward_runtime'] = self._furnace_feedforward.snapshot()
@@ -1441,8 +1419,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         """Read telemetry only. Learning failures must not interrupt furnace control."""
         try:
             temperature = float(state.state) if state is not None else None
-            if self._furnace_feedforward is not None:
-                self._furnace_feedforward.observe_room(time.time(), temperature)
             outputs = [self.hass.states.get(e) for e in self._heater_entity_id or []]
             available = bool(outputs) and all(s is not None and s.state in ('on', 'off') for s in outputs)
             fresh = state is not None and time.time() - state.last_updated.timestamp() <= self._observer.max_gap
@@ -1538,18 +1514,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 self._control_output = int(self._control_output)
             self._control_output = max(min(self._control_output, self._max_out), self._min_out)
 
-            furnace_feedforward = getattr(self, '_furnace_feedforward', None)
-            if furnace_feedforward is not None:
-                now = time.time()
-                response_records = (getattr(self, '_furnace_response_records', [])
-                                    + self._observer.records)
-                if furnace_feedforward.coast_active(response_records, now):
-                    furnace_feedforward.last_diagnostics.update(
-                        raw_pid_output=round(self._pid_output, 3),
-                        final_demand=0,
-                    )
-                    self._control_output = 0
-
             await self.set_control_value()
             self.async_write_ha_state()
 
@@ -1608,7 +1572,19 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             _LOGGER.debug("%s: %s already ON; skipping duplicate command.",
                           self.entity_id, ", ".join([entity for entity in targets]))
             return True
-        elif time.time() - self._last_heat_cycle_time >= self._min_off_cycle_duration.seconds:
+        furnace_feedforward = getattr(self, '_furnace_feedforward', None)
+        if furnace_feedforward is not None and self._hvac_mode == HVACMode.HEAT:
+            response_records = list(getattr(self, '_furnace_response_records', []))
+            if self._observer is not None:
+                response_records.extend(self._observer.records)
+            if furnace_feedforward.blocks_new_heat_call(response_records, time.time()):
+                _LOGGER.info(
+                    "%s: Residual furnace heat remains; deferring a new heat call for %s",
+                    self.entity_id,
+                    ", ".join(targets),
+                )
+                return False
+        if time.time() - self._last_heat_cycle_time >= self._min_off_cycle_duration.seconds:
             _LOGGER.info("%s: Turning ON %s", self.entity_id,
                          ", ".join([entity for entity in self.heater_or_cooler_entity]))
             self._last_heat_cycle_time = time.time()
@@ -1629,6 +1605,10 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             else:
                 on_value = self._output_min if self._heater_polarity_invert else self._output_max
                 await self._async_set_entity_value(heater_or_cooler_entity, on_value)
+        if furnace_feedforward is not None and self._hvac_mode == HVACMode.HEAT:
+            furnace_feedforward.clear_coast()
+            if getattr(self, '_observer_store', None) is not None:
+                self._observer_store.async_delay_save(self._learning_snapshot, 1)
         return True
 
     def _async_update_furnace_temperature(self, state):
@@ -1685,7 +1665,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         if (command_sent and not force and self._furnace_feedforward is not None
                 and self._hvac_mode == HVACMode.HEAT):
             self._furnace_feedforward.begin_coast(time.time())
-            if self._observer_store is not None:
+            if getattr(self, '_observer_store', None) is not None:
                 self._observer_store.async_delay_save(self._learning_snapshot, 1)
         return command_sent
 
@@ -1818,18 +1798,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 return
             if abs(self._control_output) == self._difference:
                 if not self._is_device_active:
-                    furnace_feedforward = getattr(self, '_furnace_feedforward', None)
-                    if furnace_feedforward is not None:
-                        response_records = (
-                            getattr(self, '_furnace_response_records', [])
-                            + (self._observer.records if self._observer is not None else []))
-                        if furnace_feedforward.coast_active(response_records, time.time()):
-                            _LOGGER.info(
-                                "%s: Residual heat is still reaching the home; holding %s OFF",
-                                self.entity_id,
-                                ", ".join(self.heater_or_cooler_entity),
-                            )
-                            return
                     _LOGGER.info("%s: Output is %s. Request turning ON %s", self.entity_id,
                                  self._difference, ", ".join([entity for entity in self.heater_or_cooler_entity]))
                 if await self._async_heater_turn_on():
@@ -1845,23 +1813,20 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         else:
             await self._async_set_valve_value(abs(self._control_output))
 
+
     @entity_operation
     async def pwm_switch(self):
-        """turn off and on the heater proportionally to control_value."""
+        """Turn the heater on and off according to the existing PID PWM duty."""
         time_passed = time.time() - self._time_changed
-        # Compute time_on based on PWM duration and PID output
         time_on = self._pwm * abs(self._control_output) / self._difference
         time_off = self._pwm - time_on
-        # Check time_on and time_off are not too short
         if 0 < time_on < self._min_on_cycle_duration.seconds:
-            # time_on is too short, increase time_off and time_on
             time_off *= self._min_on_cycle_duration.seconds / time_on
             time_on = self._min_on_cycle_duration.seconds
         if 0 < time_off < self._min_off_cycle_duration.seconds:
-            # A near-saturated output should behave as continuous demand, not as
-            # a mathematically preserved duty cycle with an hours-long on phase.
             time_on = self._pwm
             time_off = 0
+
         initial_schedule = (not getattr(self, '_pwm_schedule_initialized', False)
                             and not self._is_device_active)
         if self._is_device_active:
@@ -1869,7 +1834,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 _LOGGER.info(
                     "%s: ON time passed. Request turning OFF %s",
                     self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity])
+                    ", ".join(self.heater_or_cooler_entity),
                 )
                 if await self._async_heater_turn_off():
                     self._time_changed = time.time()
@@ -1878,49 +1843,39 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 _LOGGER.info(
                     "%s: Time until %s turns OFF: %s sec",
                     self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity]),
-                    int(time_on - time_passed)
+                    ", ".join(self.heater_or_cooler_entity),
+                    int(time_on - time_passed),
                 )
                 if self._keep_alive:
                     await self._async_heater_turn_on()
                 self._force_off = False
+            return
+
+        # The configured cold tolerance remains authoritative over a stretched
+        # low-duty PWM off phase. The residual interlock is evaluated only by
+        # _async_heater_turn_on immediately before a new output command.
+        at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
+                            and self._current_temp <= self._target_temp - self._cold_tolerance)
+        if initial_schedule:
+            self._pwm_schedule_initialized = True
+            self._force_on = False
+            return
+        if time_off <= time_passed or self._force_on or at_cold_boundary:
+            _LOGGER.info(
+                "%s: OFF time passed. Request turning ON %s",
+                self.entity_id,
+                ", ".join(self.heater_or_cooler_entity),
+            )
+            if await self._async_heater_turn_on():
+                self._time_changed = time.time()
+                self._force_on = False
         else:
-            coast_active = False
-            furnace_feedforward = getattr(self, '_furnace_feedforward', None)
-            if furnace_feedforward is not None:
-                response_records = (getattr(self, '_furnace_response_records', [])
-                                    + self._observer.records)
-                coast_active = furnace_feedforward.coast_active(
-                    response_records, time.time())
-            if coast_active:
-                _LOGGER.info("%s: Residual heat is still reaching the home; holding %s OFF",
-                             self.entity_id,
-                             ", ".join([entity for entity in self.heater_or_cooler_entity]))
-                return
-            # Once measured purge has ended, the configured cold tolerance
-            # remains authoritative over a stretched low-duty PWM off phase.
-            at_cold_boundary = (self._hvac_mode == HVACMode.HEAT
-                                and self._current_temp <= self._target_temp - self._cold_tolerance)
-            # Establish PWM phase after restore: a small positive demand is
-            # not itself grounds for an immediate minimum burn.
-            if initial_schedule:
-                self._pwm_schedule_initialized = True
-                self._force_on = False
-                return
-            if time_off <= time_passed or self._force_on or at_cold_boundary:
-                _LOGGER.info(
-                    "%s: OFF time passed. Request turning ON %s", self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity])
-                )
-                if await self._async_heater_turn_on():
-                    self._time_changed = time.time()
-                    self._force_on = False
-            else:
-                _LOGGER.info(
-                    "%s: Time until %s turns ON: %s sec", self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity]),
-                    int(time_off - time_passed)
-                )
-                if self._keep_alive:
-                    await self._async_heater_turn_off()
-                self._force_on = False
+            _LOGGER.info(
+                "%s: Time until %s turns ON: %s sec",
+                self.entity_id,
+                ", ".join(self.heater_or_cooler_entity),
+                int(time_off - time_passed),
+            )
+            if self._keep_alive:
+                await self._async_heater_turn_off()
+            self._force_on = False

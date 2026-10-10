@@ -92,7 +92,7 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         device._observer = type('Observer', (), {'records': []})()
 
         class ResidualHeat:
-            def coast_active(self, records, now):
+            def blocks_new_heat_call(self, records, now):
                 return True
 
         device._furnace_feedforward = ResidualHeat()
@@ -111,7 +111,7 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         device._observer = type('Observer', (), {'records': []})()
 
         class ResidualHeat:
-            def coast_active(self, records, now):
+            def blocks_new_heat_call(self, records, now):
                 return True
 
         device._furnace_feedforward = ResidualHeat()
@@ -130,9 +130,11 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         device._observer = type('Observer', (), {'records': []})()
 
         class ResidualHeat:
-            def coast_active(self, records, now):
+            def blocks_new_heat_call(self, records, now):
                 return False
 
+            def clear_coast(self):
+                pass
         device._furnace_feedforward = ResidualHeat()
         clock.now = 900
 
