@@ -75,6 +75,16 @@ exec(compile(ast.fix_missing_locations(ast.Module(body=[removal_class], type_ign
 
 
 class WiringTests(unittest.IsolatedAsyncioTestCase):
+    def test_start_event_constant_is_not_shadowed_in_startup_handler(self):
+        """A local import makes the earlier listener reference unbound."""
+        added = next(n for n in thermostat.body if isinstance(n, ast.AsyncFunctionDef)
+                     and n.name == 'async_added_to_hass')
+        inner_imports = [node for node in ast.walk(added)
+                         if isinstance(node, ast.ImportFrom)
+                         and node.module == 'homeassistant.const']
+        imported_names = {alias.name for node in inner_imports for alias in node.names}
+        self.assertNotIn('EVENT_HOMEASSISTANT_STARTED', imported_names)
+
     async def test_unload_cancels_import_and_persists_without_actuation(self):
         instance = namespace['RemovalHarness']()
         instance._operations = lifecycle.EntityOperations()

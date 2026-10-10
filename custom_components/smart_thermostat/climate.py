@@ -567,7 +567,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             if self.hass.state == CoreState.running:
                 start_import()
             else:
-                from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
                 self.async_on_remove(_async_listen_once_until_remove(
                     self.hass, EVENT_HOMEASSISTANT_STARTED, start_import))
 
