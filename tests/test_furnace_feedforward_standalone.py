@@ -102,7 +102,9 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         model.observe_room(now - 10, 21.35)
         model.begin_coast(now - 15)
         self.assertTrue(model.coast_active(self.records, now + 55))
-        self.assertEqual(model.last_diagnostics['status'], 'coast_hold_learned_peak')
+        self.assertEqual(
+            model.last_diagnostics['status'],
+            'coast_hold_remaining_furnace_energy')
 
         model.observe(now + 400, 24.9)
         model.observe_room(now + 400, 21.3)
@@ -137,8 +139,10 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         model.observe_room(now - 10, 21.35)
         model.begin_coast(now - 15, 90.0)
 
-        self.assertFalse(model.coast_active(records, now + 200))
-        self.assertEqual(model.last_diagnostics['status'], 'coast_released')
+        self.assertTrue(model.coast_active(records, now + 200))
+        self.assertEqual(
+            model.last_diagnostics['status'],
+            'coast_hold_remaining_furnace_energy')
 
     def test_restart_preserves_the_runtime_needed_for_comparable_coast(self):
         records = ([record(index, runtime=90, peak_seconds=180.0) for index in range(3)]
@@ -153,8 +157,10 @@ class FurnaceFeedForwardTests(unittest.TestCase):
         restored.observe_room(now - 20, 21.4)
         restored.observe_room(now - 10, 21.35)
 
-        self.assertFalse(restored.coast_active(records, now + 200))
-        self.assertEqual(restored.last_diagnostics['status'], 'coast_released')
+        self.assertTrue(restored.coast_active(records, now + 200))
+        self.assertEqual(
+            restored.last_diagnostics['status'],
+            'coast_hold_remaining_furnace_energy')
 
 
     def test_missing_telemetry_only_holds_through_learned_peak(self):

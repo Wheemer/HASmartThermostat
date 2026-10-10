@@ -760,9 +760,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         if self.hass.state == CoreState.running:
             await self._async_control_heating(calc_pid=True)
         else:
-            async def _async_control_after_start(*_):
+            @callback
+            def _async_control_after_start(*_):
                 if not self._operations.closed:
-                    await self._async_control_heating(calc_pid=True)
+                    self.hass.async_create_task(
+                        self._async_control_heating(calc_pid=True),
+                        f"{self.entity_id} startup control")
 
             self.async_on_remove(_async_listen_once_until_remove(
                 self.hass, EVENT_HOMEASSISTANT_STARTED, _async_control_after_start))

@@ -302,8 +302,11 @@ class FurnaceFeedForward:
             if (not _finite(self._coast_peak_temperature)
                     or furnace_temperature > self._coast_peak_temperature):
                 self._coast_peak_temperature = furnace_temperature
-        if (learned_peak_seconds is None and _finite(baseline)
-                and _finite(self._coast_peak_temperature)
+        # Learned peak timing is useful context, but it cannot overrule the
+        # measured thermal energy still stored in the furnace. A short
+        # historical coast must never permit another heat call while the
+        # current furnace remains materially above this burn's observed peak.
+        if (_finite(baseline) and _finite(self._coast_peak_temperature)
                 and self._coast_peak_temperature > baseline):
             peak_excess = self._coast_peak_temperature - baseline
             remaining_excess = max(0.0, furnace_temperature - baseline)
