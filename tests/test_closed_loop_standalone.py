@@ -84,6 +84,45 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         await device.set_control_value()
         self.assertTrue(device._is_device_active)
 
+    async def test_residual_heat_blocks_saturated_cold_boundary_refire(self):
+        """A hot furnace must suppress every positive-demand route, including 100%."""
+        device, clock = controller(calculate()['gains'], 20, 22)
+        device._control_output = 100
+        device._force_on = True
+        device._observer = type('Observer', (), {'records': []})()
+
+        class ResidualHeat:
+            def coast_active(self, records, now):
+                return True
+
+        device._furnace_feedforward = ResidualHeat()
+        clock.now = 900
+
+        await device.set_control_value()
+
+        self.assertFalse(device._is_device_active)
+        self.assertEqual(device.transitions, [])
+
+    async def test_residual_heat_blocks_forced_pwm_refire(self):
+        """A setpoint increase must not override measured residual furnace heat."""
+        device, clock = controller(calculate()['gains'], 20, 22)
+        device._control_output = 20
+        device._force_on = True
+        device._observer = type('Observer', (), {'records': []})()
+
+        class ResidualHeat:
+            def coast_active(self, records, now):
+                return True
+
+        device._furnace_feedforward = ResidualHeat()
+        clock.now = 900
+
+        await device.set_control_value()
+
+        self.assertFalse(device._is_device_active)
+        self.assertEqual(device.transitions, [])
+        self.assertTrue(device._force_on)
+
     async def test_cooler_duty_increases_as_room_gets_hotter(self):
         gains = {'kp': 10.0, 'ki': 0.0, 'kd': 0.0}
         far, far_clock = controller(gains, 27, 22, mode='cool')

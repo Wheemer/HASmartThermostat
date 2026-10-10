@@ -1831,6 +1831,18 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 return
             if abs(self._control_output) == self._difference:
                 if not self._is_device_active:
+                    furnace_feedforward = getattr(self, '_furnace_feedforward', None)
+                    if furnace_feedforward is not None:
+                        response_records = (
+                            getattr(self, '_furnace_response_records', [])
+                            + (self._observer.records if self._observer is not None else []))
+                        if furnace_feedforward.coast_active(response_records, time.time()):
+                            _LOGGER.info(
+                                "%s: Residual heat is still reaching the home; holding %s OFF",
+                                self.entity_id,
+                                ", ".join(self.heater_or_cooler_entity),
+                            )
+                            return
                     _LOGGER.info("%s: Output is %s. Request turning ON %s", self.entity_id,
                                  self._difference, ", ".join([entity for entity in self.heater_or_cooler_entity]))
                 if await self._async_heater_turn_on():
@@ -1893,7 +1905,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                                     + self._observer.records)
                 coast_active = furnace_feedforward.coast_active(
                     response_records, time.time())
-            if coast_active and not self._force_on:
+            if coast_active:
                 _LOGGER.info("%s: Residual heat is still reaching the home; holding %s OFF",
                              self.entity_id,
                              ", ".join([entity for entity in self.heater_or_cooler_entity]))
