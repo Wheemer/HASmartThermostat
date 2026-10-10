@@ -51,6 +51,7 @@ class FurnaceFeedForward:
         self._samples = []
         self._room_samples = []
         self._coast_started = None
+        self._coast_peak_temperature = None
         self.last_diagnostics = {'status': 'waiting_for_sensor'}
 
     def observe(self, now, temperature):
@@ -73,6 +74,8 @@ class FurnaceFeedForward:
         """Begin a live residual-heat coast after a heat call ends."""
         if _finite(now):
             self._coast_started = now
+            self._coast_peak_temperature = (
+                self._samples[-1][1] if self._samples else None)
 
     def resume_coast_from_live_furnace_heat(self, records, now):
         """Rebuild a lost coast marker from live, measured residual heat.
@@ -90,6 +93,7 @@ class FurnaceFeedForward:
                 or furnace_temperature <= baseline):
             return False
         self._coast_started = now
+        self._coast_peak_temperature = furnace_temperature
         self.last_diagnostics = {
             'status': 'coast_resumed_from_live_furnace_heat',
             'coast_started': round(now, 3),
@@ -115,9 +119,27 @@ class FurnaceFeedForward:
             return False
 
         baseline = _baseline(records, now)
-        thermal_release = (furnace_slope > 0 or (
-            baseline is not None and furnace_temperature > baseline and room_slope > 0))
-        if thermal_release:
+        if (not _finite(self._coast_peak_temperature)
+                or furnace_temperature > self._coast_peak_temperature):
+            self._coast_peak_temperature = furnace_temperature
+
+        # A falling furnace temperature is still stored heat.  The next burn
+        # must wait until the observed post-off heat has returned to the
+        # furnace's learned resting level; this remains a pre-fire guard and
+        # never changes PID demand or turns an active burn off.
+        if baseline is not None and furnace_temperature > baseline:
+            self.last_diagnostics = {
+                'status': 'coast_hold_stored_furnace_heat',
+                'coast_started': round(self._coast_started, 3),
+                'furnace_temperature_c': round(furnace_temperature, 3),
+                'furnace_peak_c': round(self._coast_peak_temperature, 3),
+                'furnace_slope_c_per_min': round(furnace_slope, 3),
+                'room_slope_c_per_min': round(room_slope, 3),
+                'baseline_c': round(baseline, 3),
+            }
+            return True
+
+        if furnace_slope > 0:
             self.last_diagnostics = {
                 'status': 'coast_hold_active_purge',
                 'coast_started': round(self._coast_started, 3),
@@ -129,6 +151,7 @@ class FurnaceFeedForward:
             return True
 
         self._coast_started = None
+        self._coast_peak_temperature = None
         self.last_diagnostics = {
             'status': 'coast_released',
             'furnace_slope_c_per_min': round(furnace_slope, 3),
@@ -138,7 +161,10 @@ class FurnaceFeedForward:
         return False
 
     def snapshot(self):
-        return {'coast_started': self._coast_started}
+        return {
+            'coast_started': self._coast_started,
+            'coast_peak_temperature': self._coast_peak_temperature,
+        }
 
     def restore(self, data):
         if not isinstance(data, dict):
@@ -146,3 +172,6 @@ class FurnaceFeedForward:
         started = data.get('coast_started', data.get('manual_coast_started'))
         if _finite(started):
             self._coast_started = started
+        peak_temperature = data.get('coast_peak_temperature')
+        if _finite(peak_temperature):
+            self._coast_peak_temperature = peak_temperature

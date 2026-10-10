@@ -35,22 +35,25 @@ class FurnaceResidualHeatGuardTests(unittest.TestCase):
         guard.begin_coast(self.now - 1)
 
         self.assertTrue(guard.coast_active(self.records, self.now))
-        self.assertEqual(guard.last_diagnostics['status'], 'coast_hold_active_purge')
+        self.assertEqual(
+            guard.last_diagnostics['status'], 'coast_hold_stored_furnace_heat')
 
-    def test_warm_furnace_blocks_only_while_house_is_still_warming(self):
+    def test_falling_but_still_hot_furnace_blocks_immediate_refire(self):
         guard = module.FurnaceFeedForward()
         guard.observe(self.now - 30, 36.0)
         guard.observe(self.now, 34.0)
         guard.observe_room(self.now - 30, 21.0)
-        guard.observe_room(self.now, 21.1)
+        guard.observe_room(self.now, 21.0)
         guard.begin_coast(self.now - 1)
 
         self.assertTrue(guard.coast_active(self.records, self.now))
+        self.assertEqual(
+            guard.last_diagnostics['status'], 'coast_hold_stored_furnace_heat')
 
-    def test_guard_releases_when_furnace_and_house_are_no_longer_rising(self):
+    def test_guard_releases_only_after_furnace_returns_to_resting_baseline(self):
         guard = module.FurnaceFeedForward()
-        guard.observe(self.now - 30, 36.0)
-        guard.observe(self.now, 34.0)
+        guard.observe(self.now - 30, 25.4)
+        guard.observe(self.now, 25.0)
         guard.observe_room(self.now - 30, 21.1)
         guard.observe_room(self.now, 21.0)
         guard.begin_coast(self.now - 1)
@@ -67,6 +70,7 @@ class FurnaceResidualHeatGuardTests(unittest.TestCase):
 
     def test_restart_marker_uses_new_live_measurements(self):
         original = module.FurnaceFeedForward()
+        original.observe(self.now - 1, 47.6)
         original.begin_coast(self.now - 1)
         restored = module.FurnaceFeedForward()
         restored.restore(original.snapshot())
@@ -76,6 +80,7 @@ class FurnaceResidualHeatGuardTests(unittest.TestCase):
         restored.observe_room(self.now, 21.0)
 
         self.assertTrue(restored.coast_active(self.records, self.now))
+        self.assertEqual(restored.snapshot()['coast_peak_temperature'], 47.6)
 
     def test_reload_resumes_guard_only_above_learned_baseline(self):
         guard = module.FurnaceFeedForward()
