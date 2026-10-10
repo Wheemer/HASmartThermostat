@@ -186,26 +186,21 @@ class WiringTests(unittest.IsolatedAsyncioTestCase):
         t._coast_control.observe_output(now - 151, True)
         return t, sensor, output
 
-    async def test_calibrated_furnace_heat_reduces_demand_without_actuator_rule(self):
+    async def test_active_residual_heat_temporarily_holds_pid_output_at_zero(self):
         t, _, _ = self.make_thermostat()
 
         class FeedForward:
-            last_diagnostics = {'status': 'calibrated'}
+            last_diagnostics = {'status': 'coast_hold_active_purge'}
 
             def coast_active(self, records, now):
-                return False
-
-            def pending_rise(self, records, now, runtime_seconds, heating):
-                self.called = (records, runtime_seconds, heating)
-                return 0.3
+                return True
 
         t._pid_output = 60
         t._furnace_feedforward = FeedForward()
         await control_method(t)
 
-        self.assertEqual(t._control_output, 30)
-        self.assertEqual(t._furnace_feedforward.last_diagnostics['demand_reduction_pct'], 30)
-        self.assertTrue(t._furnace_feedforward.called[2])
+        self.assertEqual(t._control_output, 0)
+        self.assertEqual(t._furnace_feedforward.last_diagnostics['final_demand'], 0)
         t._async_heater_turn_off.assert_not_awaited()
 
     async def test_removed_coast_suppressor_leaves_pid_demand_intact(self):

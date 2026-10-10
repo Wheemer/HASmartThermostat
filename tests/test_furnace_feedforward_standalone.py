@@ -1,4 +1,4 @@
-"""Tests for furnace residual-heat compensation without Home Assistant."""
+"""Tests for the measured post-off furnace residual-heat guard."""
 
 import importlib.util
 from pathlib import Path
@@ -12,191 +12,80 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def record(index, furnace_end=50.0, coast=0.35, runtime=240, peak_seconds=300.0):
-    start = 1_000_000 + index * 1_000
-    stopped = start + runtime
-    return {
-        'started': start,
-        'completed': stopped + 900,
-        'stopped': stopped,
-        'runtime_seconds': runtime,
-        'coast': coast,
-        'furnace_baseline': 25.0,
-        'furnace_samples': [(start + 60, 25.0), (stopped - 60, furnace_end - 2),
-                            (stopped, furnace_end)],
-        'thermal_response': {
-            'version': 1,
-            'on_seconds': runtime,
-            'post_off_peak_seconds': peak_seconds,
-            'post_off_observed_seconds': 900.0,
-        },
-    }
+def record(index, baseline=25.0):
+    return {'completed': 1_000_000 + index * 1_000, 'furnace_baseline': baseline}
 
 
-class FurnaceFeedForwardTests(unittest.TestCase):
+class FurnaceResidualHeatGuardTests(unittest.TestCase):
     def setUp(self):
         self.records = [record(index) for index in range(6)]
         self.now = max(row['completed'] for row in self.records) + 60
 
-    def test_no_prediction_without_six_comparable_completed_cycles(self):
-        rise, diagnostics = module.predict_pending_rise(
-            self.records[:5], self.now, 50, 2.0, 240, True)
-        self.assertIsNone(rise)
-        self.assertIn(diagnostics['status'], {'insufficient_baseline', 'insufficient_comparable_cycles'})
+    def test_guard_has_no_predictive_pid_api(self):
+        guard = module.FurnaceFeedForward()
+        self.assertFalse(hasattr(guard, 'pending_rise'))
+        self.assertFalse(hasattr(guard, 'turn_off'))
 
-    def test_calibrated_prediction_is_conservative_and_not_a_threshold(self):
-        rise, diagnostics = module.predict_pending_rise(
-            self.records, self.now, 50, 2.0, 240, True)
-        self.assertAlmostEqual(rise, 0.35)
-        self.assertEqual(diagnostics['status'], 'calibrated')
-        self.assertEqual(diagnostics['comparable_cycles'], 6)
+    def test_rising_furnace_temperature_blocks_immediate_refire(self):
+        guard = module.FurnaceFeedForward()
+        guard.observe(self.now - 30, 31.0)
+        guard.observe(self.now, 34.4)
+        guard.observe_room(self.now - 30, 21.0)
+        guard.observe_room(self.now, 21.0)
+        guard.begin_coast(self.now - 1)
 
-    def test_high_furnace_temperature_is_not_an_off_command(self):
-        rise, diagnostics = module.predict_pending_rise(
-            self.records, self.now, 75, 2.0, 240, True)
-        self.assertIsNotNone(rise)
-        self.assertEqual(diagnostics['status'], 'calibrated')
-        # The model only supplies an estimate.  It has no actuator API and
-        # therefore cannot turn the furnace off at any raw sensor reading.
-        self.assertFalse(hasattr(module.FurnaceFeedForward(), 'turn_off'))
+        self.assertTrue(guard.coast_active(self.records, self.now))
+        self.assertEqual(guard.last_diagnostics['status'], 'coast_hold_active_purge')
 
-    def test_resting_temperature_does_not_change_pid_demand(self):
-        rise, diagnostics = module.predict_pending_rise(
-            self.records, self.now, 24.5, -0.1, 240, False)
-        self.assertEqual(rise, 0.0)
-        self.assertEqual(diagnostics['status'], 'at_rest')
+    def test_warm_furnace_blocks_only_while_house_is_still_warming(self):
+        guard = module.FurnaceFeedForward()
+        guard.observe(self.now - 30, 36.0)
+        guard.observe(self.now, 34.0)
+        guard.observe_room(self.now - 30, 21.0)
+        guard.observe_room(self.now, 21.1)
+        guard.begin_coast(self.now - 1)
 
-    def test_invalid_live_sensor_leaves_controller_uncompensated(self):
-        rise, diagnostics = module.predict_pending_rise(
-            self.records, self.now, None, 2.0, 240, True)
-        self.assertIsNone(rise)
-        self.assertEqual(diagnostics['status'], 'invalid_live_sensor')
+        self.assertTrue(guard.coast_active(self.records, self.now))
 
-    def test_outlier_coast_does_not_create_aggressive_prediction(self):
-        records = [record(index, coast=0.35) for index in range(8)]
-        records[-1]['coast'] = 4.0
-        rise, _ = module.predict_pending_rise(records, self.now, 50, 2.0, 240, True)
-        self.assertAlmostEqual(rise, 0.35)
+    def test_guard_releases_when_furnace_and_house_are_no_longer_rising(self):
+        guard = module.FurnaceFeedForward()
+        guard.observe(self.now - 30, 36.0)
+        guard.observe(self.now, 34.0)
+        guard.observe_room(self.now - 30, 21.1)
+        guard.observe_room(self.now, 21.0)
+        guard.begin_coast(self.now - 1)
 
-    def test_ninety_second_burns_can_calibrate_the_feedforward_model(self):
-        records = [record(index, runtime=90) for index in range(6)]
-        rise, diagnostics = module.predict_pending_rise(
-            records, self.now, 50, 2.0, 90, True)
-        self.assertAlmostEqual(rise, 0.35)
-        self.assertEqual(diagnostics['status'], 'calibrated')
+        self.assertFalse(guard.coast_active(self.records, self.now))
+        self.assertEqual(guard.last_diagnostics['status'], 'coast_released')
 
-    def test_active_burn_matches_same_historical_furnace_phase(self):
-        rise, diagnostics = module.predict_pending_rise(
-            self.records, self.now, 35.0, 1.0, 120, True)
-        self.assertAlmostEqual(rise, 0.35)
-        self.assertEqual(diagnostics['status'], 'calibrated_heating_phase')
-        self.assertEqual(diagnostics['strategy'], 'heating_phase')
-        self.assertEqual(diagnostics['comparable_cycles'], 6)
+    def test_missing_telemetry_does_not_hold_heat_off(self):
+        guard = module.FurnaceFeedForward()
+        guard.begin_coast(self.now)
 
-    def test_coast_holds_through_the_learned_peak_while_furnace_cools(self):
-        model = module.FurnaceFeedForward()
-        now = self.now
-        model.observe(now - 20, 56.0)
-        model.observe(now - 10, 55.0)
-        model.observe_room(now - 20, 21.4)
-        model.observe_room(now - 10, 21.35)
-        model.begin_coast(now - 15)
-        self.assertTrue(model.coast_active(self.records, now + 55))
-        self.assertEqual(
-            model.last_diagnostics['status'],
-            'coast_hold_remaining_furnace_energy')
+        self.assertFalse(guard.coast_active(self.records, self.now + 1))
+        self.assertEqual(guard.last_diagnostics['status'], 'coast_unverified')
 
-        model.observe(now + 400, 24.9)
-        model.observe_room(now + 400, 21.3)
-        self.assertFalse(model.coast_active(self.records, now + 400))
-        self.assertEqual(model.last_diagnostics['status'], 'coast_released')
-
-    def test_coast_holds_when_a_hot_furnace_has_started_cooling(self):
-        model = module.FurnaceFeedForward()
-        now = self.now
-        records = [dict(row, thermal_response={}) for row in self.records]
-        model.observe(now - 10, 27.0)
-        model.observe_room(now - 10, 21.5)
-        model.begin_coast(now, 90.0)
-
-        # This is the failure mode from the live system: a short burn ends,
-        # the furnace continues to climb, then has only just started cooling.
-        model.observe(now + 150, 34.8)
-        model.observe_room(now + 150, 21.5)
-        self.assertTrue(model.coast_active(records, now + 150))
-        self.assertEqual(
-            model.last_diagnostics['status'],
-            'coast_hold_remaining_furnace_energy')
-
-    def test_coast_uses_only_similar_length_burns_for_peak_timing(self):
-        records = ([record(index, runtime=90, peak_seconds=180.0) for index in range(3)]
-                   + [record(index + 10, runtime=600, peak_seconds=900.0) for index in range(3)])
-        now = max(row['completed'] for row in records) + 60
-        model = module.FurnaceFeedForward()
-        model.observe(now - 20, 56.0)
-        model.observe(now - 10, 55.0)
-        model.observe_room(now - 20, 21.4)
-        model.observe_room(now - 10, 21.35)
-        model.begin_coast(now - 15, 90.0)
-
-        self.assertTrue(model.coast_active(records, now + 200))
-        self.assertEqual(
-            model.last_diagnostics['status'],
-            'coast_hold_remaining_furnace_energy')
-
-    def test_restart_preserves_the_runtime_needed_for_comparable_coast(self):
-        records = ([record(index, runtime=90, peak_seconds=180.0) for index in range(3)]
-                   + [record(index + 10, runtime=600, peak_seconds=900.0) for index in range(3)])
-        now = max(row['completed'] for row in records) + 60
-        model = module.FurnaceFeedForward()
-        model.begin_coast(now - 15, 90.0)
+    def test_restart_marker_uses_new_live_measurements(self):
+        original = module.FurnaceFeedForward()
+        original.begin_coast(self.now - 1)
         restored = module.FurnaceFeedForward()
-        restored.restore(model.snapshot())
-        restored.observe(now - 20, 56.0)
-        restored.observe(now - 10, 55.0)
-        restored.observe_room(now - 20, 21.4)
-        restored.observe_room(now - 10, 21.35)
+        restored.restore(original.snapshot())
+        restored.observe(self.now - 30, 31.0)
+        restored.observe(self.now, 34.4)
+        restored.observe_room(self.now - 30, 21.0)
+        restored.observe_room(self.now, 21.0)
 
-        self.assertTrue(restored.coast_active(records, now + 200))
-        self.assertEqual(
-            restored.last_diagnostics['status'],
-            'coast_hold_remaining_furnace_energy')
+        self.assertTrue(restored.coast_active(self.records, self.now))
 
-    def test_reload_rebuilds_coast_from_live_furnace_heat_when_marker_is_missing(self):
-        model = module.FurnaceFeedForward()
-        model.observe(self.now, 34.4)
+    def test_reload_resumes_guard_only_above_learned_baseline(self):
+        guard = module.FurnaceFeedForward()
+        guard.observe(self.now, 34.4)
+        self.assertTrue(guard.resume_coast_from_live_furnace_heat(self.records, self.now))
 
-        self.assertTrue(model.resume_coast_from_live_furnace_heat(
-            self.records, self.now))
-        self.assertEqual(
-            model.last_diagnostics['status'],
-            'coast_resumed_from_live_furnace_heat')
+        at_rest = module.FurnaceFeedForward()
+        at_rest.observe(self.now, 25.0)
+        self.assertFalse(at_rest.resume_coast_from_live_furnace_heat(self.records, self.now))
 
-        model.observe(self.now + 30, 34.0)
-        model.observe_room(self.now, 21.0)
-        model.observe_room(self.now + 30, 21.0)
-        self.assertTrue(model.coast_active(self.records, self.now + 30))
-        self.assertEqual(
-            model.last_diagnostics['status'],
-            'coast_hold_remaining_furnace_energy')
-
-    def test_reload_does_not_create_coast_at_or_below_resting_temperature(self):
-        model = module.FurnaceFeedForward()
-        model.observe(self.now, 25.0)
-
-        self.assertFalse(model.resume_coast_from_live_furnace_heat(
-            self.records, self.now))
-
-
-    def test_missing_telemetry_only_holds_through_learned_peak(self):
-        model = module.FurnaceFeedForward()
-        model.begin_coast(self.now)
-
-        self.assertTrue(model.coast_active(self.records, self.now + 60))
-        self.assertEqual(model.last_diagnostics['status'], 'coast_waiting_for_telemetry')
-
-        self.assertFalse(model.coast_active(self.records, self.now + 301))
-        self.assertEqual(model.last_diagnostics['status'], 'coast_released_no_telemetry')
 
 if __name__ == '__main__':
     unittest.main()

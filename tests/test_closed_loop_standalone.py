@@ -84,8 +84,8 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         await device.set_control_value()
         self.assertTrue(device._is_device_active)
 
-    async def test_cold_tolerance_starts_saturated_demand_despite_residual_heat(self):
-        """The thermostat's configured cold boundary remains authoritative."""
+    async def test_active_residual_heat_blocks_saturated_refire(self):
+        """A proven post-off purge defers even a saturated re-fire."""
         device, clock = controller(calculate()['gains'], 20, 22)
         device._control_output = 100
         device._force_on = True
@@ -100,8 +100,8 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
 
         await device.set_control_value()
 
-        self.assertTrue(device._is_device_active)
-        self.assertEqual(device.transitions, [(900, True)])
+        self.assertFalse(device._is_device_active)
+        self.assertEqual(device.transitions, [])
 
     async def test_residual_heat_blocks_forced_pwm_before_cold_boundary(self):
         """Residual heat can defer a forced call before the configured boundary."""
@@ -123,15 +123,15 @@ class ClosedLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device.transitions, [])
         self.assertTrue(device._force_on)
 
-    async def test_cold_tolerance_starts_pwm_demand_despite_residual_heat(self):
-        """Residual heat cannot defer a normal PID call below cold tolerance."""
+    async def test_cold_tolerance_starts_as_soon_as_active_purge_is_over(self):
+        """The guard cannot delay a call after purge evidence disappears."""
         device, clock = controller(calculate()['gains'], 20, 22)
         device._control_output = 20
         device._observer = type('Observer', (), {'records': []})()
 
         class ResidualHeat:
             def coast_active(self, records, now):
-                return True
+                return False
 
         device._furnace_feedforward = ResidualHeat()
         clock.now = 900
